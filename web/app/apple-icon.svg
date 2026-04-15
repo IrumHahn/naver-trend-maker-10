@@ -1,0 +1,21 @@
+<svg width="180" height="180" viewBox="0 0 180 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="180" height="180" rx="44" fill="#F6F1E8"/>
+  <rect x="16" y="16" width="148" height="148" rx="34" fill="url(#bg)"/>
+  <path d="M62 124C62 108.536 74.536 96 90 96C105.464 96 118 108.536 118 124V127H62V124Z" fill="#274254"/>
+  <path d="M70 128H110C116.627 128 122 133.373 122 140C122 146.627 116.627 152 110 152H70C63.3726 152 58 146.627 58 140C58 133.373 63.3726 128 70 128Z" fill="#1C3140"/>
+  <circle cx="90" cy="98" r="30" fill="url(#orb)"/>
+  <circle cx="82" cy="88" r="8" fill="rgba(255,255,255,0.34)"/>
+  <path d="M58 74L81 30L107 76L95 70L82 74H58Z" fill="#203240"/>
+  <path d="M101 42L110 31L115 45L126 49L115 55L110 69L101 58L89 55L101 49V42Z" fill="#F1D29A"/>
+  <defs>
+    <linearGradient id="bg" x1="26" y1="26" x2="154" y2="154" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5B7A7B"/>
+      <stop offset="1" stop-color="#24384A"/>
+    </linearGradient>
+    <radialGradient id="orb" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(80 78) rotate(54.5475) scale(54.9067)">
+      <stop stop-color="#DDF3FF"/>
+      <stop offset="0.45" stop-color="#8ED1D5"/>
+      <stop offset="1" stop-color="#466A7A"/>
+    </radialGradient>
+  </defs>
+</svg>

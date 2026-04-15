@@ -1,0 +1,20 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "hanirum-sourcing-trend-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": {
+    "crons": ["*/2 * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hanirum-sourcing-trends",
+      "database_id": "a02beff8-a05f-40ed-848a-f356d8b8e538"
+    }
+  ],
+  "vars": {
+    "APP_NAME": "hanirum-sourcing-trend-api"
+  }
+}
