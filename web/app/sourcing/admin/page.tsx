@@ -196,6 +196,18 @@ export default function SourcingAdminPage() {
       : "첫 데이터를 기다리는 중입니다.";
 
   useEffect(() => {
+    const storedUrl = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? "");
+
+    if (!storedUrl) {
+      return;
+    }
+
+    setApiBaseUrl(storedUrl);
+    setApiBaseUrlDraft(storedUrl);
+    setActiveSetupPanel(null);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
     async function loadInitial() {
@@ -2586,14 +2598,6 @@ function mergeRunDetail(previous: TrendRunDetail, next: TrendRunDetail) {
 }
 
 function getInitialApiBaseUrl() {
-  if (typeof window !== "undefined") {
-    const storedUrl = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? "");
-
-    if (storedUrl) {
-      return storedUrl;
-    }
-  }
-
   return ENV_API_BASE_URL;
 }
 
