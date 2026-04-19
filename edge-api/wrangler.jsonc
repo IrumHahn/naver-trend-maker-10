@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "hanirum-sourcing-trend-api",
+  "name": "naver-trend-maker-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-11",
   "compatibility_flags": ["nodejs_compat"],
@@ -10,11 +10,11 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "hanirum-sourcing-trends",
-      "database_id": "a02beff8-a05f-40ed-848a-f356d8b8e538"
+      "database_name": "naver-trend-maker-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
     }
   ],
   "vars": {
-    "APP_NAME": "hanirum-sourcing-trend-api"
+    "APP_NAME": "naver-trend-maker-api"
   }
 }

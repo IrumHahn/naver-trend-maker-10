@@ -6,14 +6,19 @@ import {
   ArrowLeft,
   ArrowRight,
   BarChart3,
+  BookOpen,
   CalendarClock,
   CheckCircle2,
   CircleHelp,
+  Cloud,
   Clock3,
+  ExternalLink,
   Flame,
   PauseCircle,
   LoaderCircle,
+  PlugZap,
   Search,
+  Settings2,
   ShieldAlert,
   Sparkles,
   Target,
@@ -44,9 +49,8 @@ import {
 import { STATIC_TREND_ROOT_CATEGORIES, getStaticTrendCategoryChildren } from "../../../lib/trend-category-fallback";
 import styles from "./admin.module.css";
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ??
-  "https://hanirum-sourcing-trend-api.redpill-han.workers.dev/v1";
+const ENV_API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "");
+const API_BASE_STORAGE_KEY = "hanirum:naver-trend-api-base-url";
 
 const DEVICE_OPTIONS = [
   ["pc", "PC"],
@@ -123,6 +127,8 @@ type ActionModalState =
     }
   | null;
 
+type SetupPanel = "settings" | "guide" | null;
+
 const initialForm: TrendFormState = {
   category1: "",
   category2: "",
@@ -136,6 +142,9 @@ const initialForm: TrendFormState = {
 };
 
 export default function SourcingAdminPage() {
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => getInitialApiBaseUrl());
+  const [apiBaseUrlDraft, setApiBaseUrlDraft] = useState(() => getInitialApiBaseUrl());
+  const [activeSetupPanel, setActiveSetupPanel] = useState<SetupPanel>(() => (getInitialApiBaseUrl() ? null : "settings"));
   const [trendBoard, setTrendBoard] = useState<TrendAdminBoard | null>(null);
   const [currentRun, setCurrentRun] = useState<TrendRunDetail | null>(null);
   const [level1Categories, setLevel1Categories] = useState<TrendCategoryNode[]>([]);
@@ -167,6 +176,12 @@ export default function SourcingAdminPage() {
     );
   }, [form.category1, form.category2, form.category3, level1Categories, level2Categories, level3Categories]);
 
+  const apiConfigured = Boolean(apiBaseUrl);
+  const apiSourceLabel = apiBaseUrl
+    ? apiBaseUrl === ENV_API_BASE_URL
+      ? "환경변수 연결"
+      : "브라우저 설정 연결"
+    : "연결 필요";
   const visibleRun = currentRun ?? trendBoard?.runs[0] ?? null;
   const completedRuns = (trendBoard?.runs ?? []).filter((run) => run.status === "completed" && run.analysisReady);
   const summaryPeriodLabel = `${TREND_MONTHLY_START_PERIOD} ~ ${latestCollectiblePeriod}`;
@@ -186,9 +201,18 @@ export default function SourcingAdminPage() {
     async function loadInitial() {
       setLoading(true);
 
+      if (!apiBaseUrl) {
+        setTrendBoard(null);
+        setCurrentRun(null);
+        setLevel1Categories(STATIC_TREND_ROOT_CATEGORIES);
+        setError(null);
+        setLoading(false);
+        return;
+      }
+
       const [boardResponse, categories] = await Promise.all([
-        api<TrendBoardResponse>("/trends/admin/board"),
-        fetchTrendCategories("0")
+        api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board"),
+        fetchTrendCategories(apiBaseUrl, "0")
       ]);
 
       if (cancelled) {
@@ -211,7 +235,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [apiBaseUrl]);
 
   useEffect(() => {
     if (!trendBoard?.runs.length) {
@@ -229,12 +253,16 @@ export default function SourcingAdminPage() {
   }, [trendBoard]);
 
   useEffect(() => {
+    if (!apiBaseUrl) {
+      return;
+    }
+
     const interval = window.setInterval(() => {
-      void refreshBoard(setTrendBoard, setCurrentRun, setRefreshing, setError);
+      void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
     }, visibleRun?.status === "running" || visibleRun?.status === "queued" ? 5000 : 12000);
 
     return () => window.clearInterval(interval);
-  }, [visibleRun?.status]);
+  }, [apiBaseUrl, visibleRun?.status]);
 
   useEffect(() => {
     if (!form.category1) {
@@ -246,7 +274,7 @@ export default function SourcingAdminPage() {
     let cancelled = false;
 
     async function loadLevel2() {
-      const nodes = await fetchTrendCategories(form.category1);
+      const nodes = await fetchTrendCategories(apiBaseUrl, form.category1);
 
       if (cancelled) {
         return;
@@ -260,7 +288,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, [form.category1]);
+  }, [apiBaseUrl, form.category1]);
 
   useEffect(() => {
     if (!form.category2) {
@@ -271,7 +299,7 @@ export default function SourcingAdminPage() {
     let cancelled = false;
 
     async function loadLevel3() {
-      const nodes = await fetchTrendCategories(form.category2);
+      const nodes = await fetchTrendCategories(apiBaseUrl, form.category2);
 
       if (cancelled) {
         return;
@@ -285,7 +313,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, [form.category2]);
+  }, [apiBaseUrl, form.category2]);
 
   useEffect(() => {
     const latestCompletedPeriod = visibleRun?.latestCompletedPeriod;
@@ -312,10 +340,63 @@ export default function SourcingAdminPage() {
       };
     });
 
-    void loadSnapshots(visibleRun, latestCompletedPeriod, 1, setSnapshotPanel);
-  }, [visibleRun?.id, visibleRun?.latestCompletedPeriod, visibleRun?.profile.resultCount]);
+    if (apiBaseUrl) {
+      void loadSnapshots(apiBaseUrl, visibleRun, latestCompletedPeriod, 1, setSnapshotPanel);
+    }
+  }, [apiBaseUrl, visibleRun?.id, visibleRun?.latestCompletedPeriod, visibleRun?.profile.resultCount]);
+
+  function handleSaveApiBaseUrl() {
+    const normalizedUrl = normalizeApiBaseUrl(apiBaseUrlDraft);
+
+    if (!normalizedUrl) {
+      setError("Cloudflare Worker API 주소를 입력해 주세요. 예: https://your-worker.your-subdomain.workers.dev/v1");
+      setFeedback({
+        tone: "error",
+        text: "API 주소가 비어 있어 저장하지 못했습니다."
+      });
+      return;
+    }
+
+    window.localStorage.setItem(API_BASE_STORAGE_KEY, normalizedUrl);
+    setApiBaseUrl(normalizedUrl);
+    setApiBaseUrlDraft(normalizedUrl);
+    setTrendBoard(null);
+    setCurrentRun(null);
+    setSnapshotPanel(null);
+    setError(null);
+    setFeedback({
+      tone: "success",
+      text: "API 주소를 저장했습니다. 이제 이 브라우저는 해당 Cloudflare Worker를 사용합니다."
+    });
+  }
+
+  function handleResetApiBaseUrl() {
+    window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+    const nextUrl = ENV_API_BASE_URL;
+    setApiBaseUrl(nextUrl);
+    setApiBaseUrlDraft(nextUrl);
+    setTrendBoard(null);
+    setCurrentRun(null);
+    setSnapshotPanel(null);
+    setFeedback({
+      tone: "info",
+      text: nextUrl
+        ? "브라우저 설정을 지우고 배포 환경변수의 API 주소로 되돌렸습니다."
+        : "API 주소 설정을 지웠습니다. 새 Worker 주소를 입력하면 분석을 시작할 수 있습니다."
+    });
+  }
 
   async function handleStartAnalysis() {
+    if (!apiBaseUrl) {
+      setActiveSetupPanel("settings");
+      setError("먼저 Cloudflare Worker API 주소를 설정해 주세요.");
+      setFeedback({
+        tone: "error",
+        text: "공용 API 기본 연결은 제거되었습니다. 본인 Cloudflare Worker 주소를 저장한 뒤 분석을 시작해 주세요."
+      });
+      return;
+    }
+
     if (!selectedCategory) {
       setError("먼저 1분류, 2분류, 3분류 중 최종 분석 카테고리를 선택해 주세요.");
       return;
@@ -328,7 +409,7 @@ export default function SourcingAdminPage() {
       text: "조건을 저장하고 바로 데이터 취합을 시작하고 있습니다."
     });
 
-    const response = await api<TrendCollectResponse>("/trends/collect", {
+    const response = await api<TrendCollectResponse>(apiBaseUrl, "/trends/collect", {
       method: "POST",
       body: JSON.stringify({
         name: buildAnalysisRequestName(selectedCategory.fullPath, form),
@@ -379,7 +460,7 @@ export default function SourcingAdminPage() {
         : "데이터 취합을 시작했습니다. 오른쪽 패널에서 진행 상황과 분석 결과를 확인해 주세요."
     });
 
-    void refreshBoard(setTrendBoard, setCurrentRun, setRefreshing, setError);
+    void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
   }
 
   async function handleConfirmAction() {
@@ -387,10 +468,17 @@ export default function SourcingAdminPage() {
       return;
     }
 
+    if (!apiBaseUrl) {
+      setActiveSetupPanel("settings");
+      setError("런을 제어하려면 Cloudflare Worker API 주소가 필요합니다.");
+      return;
+    }
+
     setActionSubmitting(true);
     setError(null);
 
     const response = await api<TrendRunActionResponse>(
+      apiBaseUrl,
       actionModal.type === "cancel" ? `/trends/runs/${actionModal.run.id}/cancel` : `/trends/runs/${actionModal.run.id}`,
       {
         method: actionModal.type === "cancel" ? "POST" : "DELETE"
@@ -435,17 +523,25 @@ export default function SourcingAdminPage() {
     }
 
     setActionModal(null);
-    void refreshBoard(setTrendBoard, setCurrentRun, setRefreshing, setError);
+    if (apiBaseUrl) {
+      void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
+    }
   }
 
   async function handleSelectArchivedRun(run: TrendRunDetail) {
+    if (!apiBaseUrl) {
+      setActiveSetupPanel("settings");
+      setError("완료 작업을 불러오려면 Cloudflare Worker API 주소가 필요합니다.");
+      return;
+    }
+
     setCurrentRun(run);
     setFeedback({
       tone: "info",
       text: "완료된 기존 작업 결과를 불러오고 있습니다."
     });
 
-    const response = await api<TrendRunResponse>(`/trends/runs/${run.id}`);
+    const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${run.id}`);
 
     if (!response.ok) {
       setError(response.message ?? "완료된 기존 작업 결과를 불러오지 못했습니다.");
@@ -530,7 +626,7 @@ export default function SourcingAdminPage() {
   useEffect(() => {
     const run = visibleRun;
 
-    if (!run?.analysisReady || run.analysisSummary || detailLoadingRunId === run.id) {
+    if (!apiBaseUrl || !run?.analysisReady || run.analysisSummary || detailLoadingRunId === run.id) {
       return;
     }
     const targetRun = run;
@@ -539,7 +635,7 @@ export default function SourcingAdminPage() {
 
     async function loadRunDetail() {
       setDetailLoadingRunId(targetRun.id);
-      const response = await api<TrendRunResponse>(`/trends/runs/${targetRun.id}`);
+      const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${targetRun.id}`);
 
       if (cancelled) {
         return;
@@ -569,7 +665,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, [detailLoadingRunId, visibleRun]);
+  }, [apiBaseUrl, detailLoadingRunId, visibleRun]);
 
   return (
     <main className={styles.page}>
@@ -588,8 +684,112 @@ export default function SourcingAdminPage() {
             <span className={styles.summaryPill}>수집 기간 {summaryPeriodLabel}</span>
             <span className={styles.summaryPill}>기본 수집 20개 · 확장 40개</span>
             <span className={styles.summaryPill}>브랜드 제품 제외 옵션 제공</span>
+            <span className={apiConfigured ? `${styles.summaryPill} ${styles.connectedPill}` : `${styles.summaryPill} ${styles.warningPill}`}>
+              API {apiSourceLabel}
+            </span>
           </div>
         </header>
+
+        <section className={`${styles.surface} ${styles.setupSurface}`}>
+          <div className={styles.setupHeader}>
+            <div>
+              <p className={styles.surfaceEyebrow}>SETUP</p>
+              <h2 className={styles.setupTitle}>Cloudflare Worker 연결</h2>
+              <p className={styles.surfaceDescription}>
+                이 저장소는 각 사용자가 본인 Cloudflare Worker와 D1을 연결해 독립적으로 작업 결과를 관리하도록 설계되었습니다.
+              </p>
+            </div>
+            <div className={styles.setupTabs} role="tablist" aria-label="Cloudflare 설정 메뉴">
+              <button
+                type="button"
+                className={activeSetupPanel === "settings" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
+                onClick={() => setActiveSetupPanel(activeSetupPanel === "settings" ? null : "settings")}
+              >
+                <Settings2 size={15} />
+                API 설정
+              </button>
+              <button
+                type="button"
+                className={activeSetupPanel === "guide" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
+                onClick={() => setActiveSetupPanel(activeSetupPanel === "guide" ? null : "guide")}
+              >
+                <BookOpen size={15} />
+                가이드
+              </button>
+            </div>
+          </div>
+
+          {activeSetupPanel === "settings" ? (
+            <div className={styles.setupPanel}>
+              <div className={styles.connectionCard}>
+                <span className={apiConfigured ? `${styles.connectionDot} ${styles.connectionDotReady}` : styles.connectionDot} />
+                <div>
+                  <strong>{apiConfigured ? "개인 Worker API가 연결되어 있습니다." : "Worker API 주소 설정이 필요합니다."}</strong>
+                  <p>
+                    {apiConfigured
+                      ? `현재 사용 중: ${apiBaseUrl}`
+                      : "Cloudflare Worker를 배포한 뒤 /v1이 붙은 API 주소를 입력해 주세요."}
+                  </p>
+                </div>
+              </div>
+
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>NEXT_PUBLIC_API_BASE_URL</span>
+                <input
+                  className={styles.fieldInput}
+                  type="url"
+                  value={apiBaseUrlDraft}
+                  onChange={(event) => setApiBaseUrlDraft(event.target.value)}
+                  placeholder="https://your-worker.your-subdomain.workers.dev/v1"
+                  spellCheck={false}
+                />
+              </label>
+
+              <div className={styles.setupActions}>
+                <button className={styles.secondaryButton} type="button" onClick={handleSaveApiBaseUrl}>
+                  <PlugZap size={15} />
+                  API 주소 저장
+                </button>
+                <button className={styles.ghostButton} type="button" onClick={handleResetApiBaseUrl}>
+                  설정 초기화
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {activeSetupPanel === "guide" ? (
+            <div className={styles.guidePanel}>
+              <GuideStep
+                number="1"
+                title="Cloudflare 가입 및 Wrangler 로그인"
+                body="Cloudflare 계정을 만든 뒤 터미널에서 Wrangler에 로그인합니다."
+                command={"pnpm install\npnpm wrangler login"}
+                link="https://developers.cloudflare.com/workers/wrangler/"
+              />
+              <GuideStep
+                number="2"
+                title="D1 데이터베이스 만들기"
+                body="트렌드 수집 결과와 분석 작업을 저장할 개인 D1 DB를 만듭니다. 생성 후 표시되는 database_id를 edge-api/wrangler.jsonc에 넣어 주세요."
+                command="pnpm wrangler d1 create naver-trend-maker-db"
+                link="https://developers.cloudflare.com/d1/get-started/"
+              />
+              <GuideStep
+                number="3"
+                title="스키마 적용 후 Worker 배포"
+                body="DB 테이블을 만든 뒤 Worker를 배포합니다. 배포가 끝나면 workers.dev 주소를 확인할 수 있습니다."
+                command={"pnpm wrangler d1 execute naver-trend-maker-db --remote --file edge-api/schema.sql\npnpm wrangler deploy --config edge-api/wrangler.jsonc"}
+                link="https://developers.cloudflare.com/d1/wrangler-commands/"
+              />
+              <GuideStep
+                number="4"
+                title="프론트에 API 주소 저장"
+                body="배포된 Worker 주소 뒤에 /v1을 붙여 이 화면의 API 설정에 저장합니다. 예: https://naver-trend-maker-api.your-subdomain.workers.dev/v1"
+                command="NEXT_PUBLIC_API_BASE_URL=https://your-worker.your-subdomain.workers.dev/v1"
+                link="https://developers.cloudflare.com/workers/wrangler/configuration/"
+              />
+            </div>
+          ) : null}
+        </section>
 
         {error ? (
           <div className={`${styles.banner} ${styles.bannerError}`}>
@@ -784,11 +984,16 @@ export default function SourcingAdminPage() {
                 </div>
               ) : null}
 
-              <button className={styles.primaryButton} type="button" onClick={() => void handleStartAnalysis()} disabled={submitting}>
+              <button className={styles.primaryButton} type="button" onClick={() => void handleStartAnalysis()} disabled={submitting || !apiConfigured}>
                 {submitting ? (
                   <>
                     <LoaderCircle className={styles.spinningIcon} size={16} />
                     분석 준비 중...
+                  </>
+                ) : !apiConfigured ? (
+                  <>
+                    <Cloud size={16} />
+                    API 설정 필요
                   </>
                 ) : (
                   <>
@@ -1120,7 +1325,7 @@ export default function SourcingAdminPage() {
                               <select
                                 className={styles.fieldInput}
                                 value={snapshotPanel?.period ?? visibleRun.latestCompletedPeriod}
-                                onChange={(event) => void loadSnapshots(visibleRun, event.target.value, 1, setSnapshotPanel)}
+                                onChange={(event) => void loadSnapshots(apiBaseUrl, visibleRun, event.target.value, 1, setSnapshotPanel)}
                               >
                                 {[...new Set(visibleRun.tasks.filter((task) => task.status === "completed").map((task) => task.period))]
                                   .sort((left, right) => right.localeCompare(left))
@@ -1137,8 +1342,8 @@ export default function SourcingAdminPage() {
                                 className={styles.secondaryButton}
                                 type="button"
                                 onClick={() =>
-                                  visibleRun && snapshotPanel
-                                    ? void loadSnapshots(visibleRun, snapshotPanel.period, snapshotPanel.page - 1, setSnapshotPanel)
+                                  visibleRun && snapshotPanel && apiBaseUrl
+                                    ? void loadSnapshots(apiBaseUrl, visibleRun, snapshotPanel.period, snapshotPanel.page - 1, setSnapshotPanel)
                                     : undefined
                                 }
                                 disabled={!snapshotPanel || snapshotPanel.page <= 1 || snapshotPanel.loading}
@@ -1150,8 +1355,8 @@ export default function SourcingAdminPage() {
                                 className={styles.secondaryButton}
                                 type="button"
                                 onClick={() =>
-                                  visibleRun && snapshotPanel
-                                    ? void loadSnapshots(visibleRun, snapshotPanel.period, snapshotPanel.page + 1, setSnapshotPanel)
+                                  visibleRun && snapshotPanel && apiBaseUrl
+                                    ? void loadSnapshots(apiBaseUrl, visibleRun, snapshotPanel.period, snapshotPanel.page + 1, setSnapshotPanel)
                                     : undefined
                                 }
                                 disabled={!snapshotPanel || snapshotPanel.page >= snapshotPanel.totalPages || snapshotPanel.loading}
@@ -1312,6 +1517,37 @@ function ProgressStat({ label, value, hint }: { label: string; value: string; hi
       <strong className={styles.progressStatValue}>{value}</strong>
       <span className={styles.progressStatHint}>{hint}</span>
     </div>
+  );
+}
+
+function GuideStep({
+  number,
+  title,
+  body,
+  command,
+  link
+}: {
+  number: string;
+  title: string;
+  body: string;
+  command: string;
+  link: string;
+}) {
+  return (
+    <article className={styles.guideStep}>
+      <div className={styles.guideStepBadge}>{number}</div>
+      <div className={styles.guideStepBody}>
+        <div className={styles.guideStepHeader}>
+          <h3>{title}</h3>
+          <a href={link} target="_blank" rel="noreferrer" aria-label={`${title} 공식 문서 열기`}>
+            공식 문서
+            <ExternalLink size={13} />
+          </a>
+        </div>
+        <p>{body}</p>
+        <pre className={styles.commandBlock}>{command}</pre>
+      </div>
+    </article>
   );
 }
 
@@ -1864,13 +2100,18 @@ function Sparkline({ points }: { points: TrendAnalysisSeriesPoint[] }) {
 }
 
 async function refreshBoard(
+  apiBaseUrl: string,
   setTrendBoard: (value: TrendAdminBoard | null) => void,
   setCurrentRun: Dispatch<SetStateAction<TrendRunDetail | null>>,
   setRefreshing: (value: boolean) => void,
   setError: (value: string | null) => void
 ) {
+  if (!apiBaseUrl) {
+    return;
+  }
+
   setRefreshing(true);
-  const response = await api<TrendBoardResponse>("/trends/admin/board");
+  const response = await api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board");
   setRefreshing(false);
 
   if (!response.ok) {
@@ -1894,8 +2135,12 @@ async function refreshBoard(
   });
 }
 
-async function fetchTrendCategories(cid: string) {
-  const response = await api<TrendCategoryResponse>(`/trends/categories/${cid}`);
+async function fetchTrendCategories(apiBaseUrl: string, cid: string) {
+  if (!apiBaseUrl) {
+    return cid === "0" ? STATIC_TREND_ROOT_CATEGORIES : getStaticTrendCategoryChildren(Number(cid));
+  }
+
+  const response = await api<TrendCategoryResponse>(apiBaseUrl, `/trends/categories/${cid}`);
 
   if (response.ok && response.nodes.length) {
     return response.nodes;
@@ -1905,6 +2150,7 @@ async function fetchTrendCategories(cid: string) {
 }
 
 async function loadSnapshots(
+  apiBaseUrl: string,
   run: TrendRunDetail,
   period: string,
   page: number,
@@ -1921,6 +2167,7 @@ async function loadSnapshots(
   }));
 
   const response = await api<TrendSnapshotPageResponse>(
+    apiBaseUrl,
     `/trends/runs/${run.id}/snapshots?period=${encodeURIComponent(period)}&page=${page}`
   );
 
@@ -2296,9 +2543,31 @@ function mergeRunDetail(previous: TrendRunDetail, next: TrendRunDetail) {
   };
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
+function getInitialApiBaseUrl() {
+  if (typeof window !== "undefined") {
+    const storedUrl = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? "");
+
+    if (storedUrl) {
+      return storedUrl;
+    }
+  }
+
+  return ENV_API_BASE_URL;
+}
+
+function normalizeApiBaseUrl(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+
+  if (!trimmed) {
+    return "";
+  }
+
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
+
+async function api<T>(apiBaseUrl: string, path: string, init?: RequestInit): Promise<T> {
   try {
-    const response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
       headers: {
         "Content-Type": "application/json",
