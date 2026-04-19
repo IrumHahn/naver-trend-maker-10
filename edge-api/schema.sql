@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS trend_runs (
   started_at TEXT,
   completed_at TEXT,
   cancelled_at TEXT,
+  confidence_score REAL,
+  analysis_summary_json TEXT,
+  analysis_cards_json TEXT,
+  analysis_cached_at TEXT,
   failure_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -54,6 +58,7 @@ CREATE TABLE IF NOT EXISTS trend_tasks (
   completed_pages INTEGER NOT NULL,
   total_pages INTEGER NOT NULL,
   retry_count INTEGER NOT NULL,
+  source TEXT,
   started_at TEXT,
   completed_at TEXT,
   failure_reason TEXT,

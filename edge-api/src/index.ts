@@ -16,12 +16,15 @@ import {
   type TrendAgeCode,
   type TrendCollectionRun,
   type TrendCollectionTask,
+  type TrendCollectionTaskSource,
   type TrendDeviceCode,
   type TrendGenderCode,
   type TrendKeywordSnapshot,
   type TrendProfile,
   type TrendProfileInput,
   type TrendResultCount,
+  type TrendAnalysisCard,
+  type TrendAnalysisSummary,
   type TrendRunDetail
 } from "../../shared/src/index";
 import { applyBrandExclusion, buildTrendAnalysis } from "./trend-analysis";
@@ -75,7 +78,13 @@ const JSON_HEADERS = {
   "access-control-allow-headers": "content-type"
 };
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
+const PROCESS_BATCH_MAX_TASKS = 8;
+const PROCESS_BATCH_MAX_WALL_MS = 25_000;
 let schemaReadyPromise: Promise<void> | null = null;
+
+type NaverSessionRef = {
+  jar?: Map<string, string>;
+};
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -98,7 +107,13 @@ export default {
       }
 
       if (request.method === "GET" && pathname === "/v1/trends/admin/board") {
-        return respondJson({ ok: true, board: await getTrendAdminBoard(env.DB) });
+        const board = await getTrendAdminBoard(env.DB);
+
+        if (await shouldKickQueuedProcessing(env.DB)) {
+          ctx.waitUntil(processQueuedRunBatch(env));
+        }
+
+        return respondJson({ ok: true, board });
       }
 
       if (request.method === "GET" && pathname === "/v1/trends/profiles") {
@@ -112,7 +127,13 @@ export default {
 
       if (request.method === "POST" && pathname === "/v1/trends/collect") {
         const body = (await request.json()) as TrendProfileInput;
-        return respondJson(await startTrendCollection(env.DB, body));
+        const response = await startTrendCollection(env.DB, body);
+
+        if (response.ok && (response.run.status === "queued" || response.run.status === "running")) {
+          ctx.waitUntil(processQueuedRunBatch(env, { runId: response.run.id }));
+        }
+
+        return respondJson(response);
       }
 
       const categoryMatch = pathname.match(/^\/v1\/trends\/categories\/([^/]+)$/);
@@ -124,7 +145,13 @@ export default {
 
       const runMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)$/);
       if (request.method === "GET" && runMatch) {
-        return respondJson(await getTrendRun(env.DB, runMatch[1]));
+        const response = await getTrendRun(env.DB, runMatch[1]);
+
+        if (response.ok && (await shouldKickQueuedProcessing(env.DB, runMatch[1]))) {
+          ctx.waitUntil(processQueuedRunBatch(env, { runId: runMatch[1] }));
+        }
+
+        return respondJson(response);
       }
 
       const cancelMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)\/cancel$/);
@@ -160,7 +187,7 @@ export default {
       }
 
       if (request.method === "POST" && pathname === "/v1/trends/worker/process-next") {
-        return respondJson(await processNextQueuedRun(env, ctx));
+        return respondJson(await processQueuedRunBatch(env));
       }
 
       return respondJson<ApiError>(
@@ -185,7 +212,7 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     await ensureSchema(env.DB);
-    ctx.waitUntil(processNextQueuedRun(env, ctx));
+    ctx.waitUntil(processQueuedRunBatch(env, { maxTasks: PROCESS_BATCH_MAX_TASKS * 2, maxWallMs: 55_000 }));
   }
 };
 
@@ -308,6 +335,18 @@ async function buildRunBoardDetail(db: D1Database, run: TrendCollectionRun): Pro
   const runningTask =
     [...tasks].find((task) => task.status === "running") ??
     [...tasks].find((task) => task.status === "pending");
+  const cacheCompletedTasks = tasks.filter((task) => task.status === "completed" && task.source === "cache").length;
+  const naverCompletedTasks = tasks.filter((task) => task.status === "completed" && task.source === "naver").length;
+  const processingMode =
+    run.status === "completed"
+      ? "idle"
+      : runningTask?.source === "cache"
+        ? "cache"
+        : runningTask?.source === "naver"
+          ? "naver"
+          : cacheCompletedTasks > naverCompletedTasks
+            ? "cache"
+            : "naver";
   const completedDurations = tasks
     .filter((task) => task.status === "completed" && task.startedAt && task.completedAt)
     .map((task) => Math.max(1, (new Date(task.completedAt!).getTime() - new Date(task.startedAt!).getTime()) / 1000));
@@ -336,6 +375,9 @@ async function buildRunBoardDetail(db: D1Database, run: TrendCollectionRun): Pro
     currentPage,
     latestCompletedPeriod,
     remainingTasks,
+    cacheCompletedTasks,
+    naverCompletedTasks,
+    processingMode,
     averageTaskSeconds,
     etaMinutes,
     estimatedCompletionAt,
@@ -587,8 +629,8 @@ async function findReusableCompletedRun(db: D1Database, profile: TrendProfile): 
         .prepare(
           `INSERT INTO trend_tasks (
             id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
-            started_at, completed_at, failure_reason, failure_snippet, updated_at
-          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, ?, ?, NULL, NULL, ?)`
+            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, ?)`
         )
         .bind(
           crypto.randomUUID(),
@@ -957,22 +999,41 @@ async function startBackfill(db: D1Database, profileId: string) {
   );
   const pendingPeriods = new Set(pendingRows.map((row) => row.period));
   const targetPeriods = periods.filter((period) => !completedMap.get(period) && !pendingPeriods.has(period));
+  const cachedPlans: Array<{ period: string; taskId: string; ranks: NaverKeywordRankItem[] }> = [];
+  const uncachedPeriods: string[] = [];
+
+  for (const period of targetPeriods) {
+    const cachedRanks = await readCachedMonthlyRanks(db, profile, period);
+
+    if (cachedRanks) {
+      cachedPlans.push({
+        period,
+        taskId: crypto.randomUUID(),
+        ranks: cachedRanks
+      });
+    } else {
+      uncachedPeriods.push(period);
+    }
+  }
+
+  const totalTasks = cachedPlans.length + uncachedPeriods.length;
+  const completedTasks = cachedPlans.length;
 
   const runRecord: TrendCollectionRun = {
     id: crypto.randomUUID(),
     profileId,
-    status: targetPeriods.length ? "queued" : "completed",
+    status: uncachedPeriods.length ? "queued" : "completed",
     requestedBy: DEFAULT_OPERATOR_ID,
     runType: "backfill",
     startPeriod: profile.startPeriod,
     endPeriod: latestCollectiblePeriod,
-    totalTasks: targetPeriods.length,
-    completedTasks: 0,
+    totalTasks,
+    completedTasks,
     failedTasks: 0,
-    totalSnapshots: 0,
+    totalSnapshots: completedTasks * profile.resultCount,
     sheetUrl: undefined,
-    startedAt: undefined,
-    completedAt: targetPeriods.length ? undefined : now,
+    startedAt: completedTasks > 0 ? now : undefined,
+    completedAt: uncachedPeriods.length ? undefined : now,
     cancelledAt: undefined,
     failureReason: undefined,
     createdAt: now,
@@ -1007,21 +1068,84 @@ async function startBackfill(db: D1Database, profileId: string) {
     ]
   );
 
-  if (targetPeriods.length > 0) {
-    const inserts = targetPeriods.map((period) =>
+  if (cachedPlans.length > 0) {
+    const cachedTaskStatements = cachedPlans.map((plan) =>
       db
         .prepare(
           `INSERT INTO trend_tasks (
             id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
-            started_at, completed_at, failure_reason, failure_snippet, updated_at
-          ) VALUES (?, ?, ?, ?, 'pending', 0, ?, 0, NULL, NULL, NULL, NULL, ?)`
+            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, ?)`
+        )
+        .bind(
+          plan.taskId,
+          runRecord.id,
+          profileId,
+          plan.period,
+          getTrendTotalPages(profile.resultCount),
+          getTrendTotalPages(profile.resultCount),
+          now,
+          now,
+          now
+        )
+    );
+    await batchInChunks(db, cachedTaskStatements, 50);
+
+    const cachedSnapshotStatements: D1PreparedStatement[] = [];
+    for (const plan of cachedPlans) {
+      await run(db, "DELETE FROM trend_snapshots WHERE profile_id = ? AND period = ?", [profileId, plan.period]);
+      cachedSnapshotStatements.push(
+        ...plan.ranks.map((rank) =>
+          db
+            .prepare(
+              `INSERT INTO trend_snapshots (
+                id, profile_id, run_id, task_id, period, rank, keyword, link_id, category_cid, category_path,
+                devices_json, genders_json, ages_json, collected_at, brand_excluded
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .bind(
+              crypto.randomUUID(),
+              profile.id,
+              runRecord.id,
+              plan.taskId,
+              plan.period,
+              rank.rank,
+              rank.keyword,
+              rank.linkId,
+              profile.categoryCid,
+              profile.categoryPath,
+              json(profile.devices),
+              json(profile.genders),
+              json(profile.ages),
+              now,
+              applyBrandExclusion(rank.keyword, profile.excludeBrandProducts ? profile.customExcludedTerms : []) ? 1 : 0
+            )
+        )
+      );
+    }
+    await batchInChunks(db, cachedSnapshotStatements, 50);
+  }
+
+  if (uncachedPeriods.length > 0) {
+    const inserts = uncachedPeriods.map((period) =>
+      db
+        .prepare(
+          `INSERT INTO trend_tasks (
+            id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
+            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', 0, ?, 0, NULL, NULL, NULL, NULL, NULL, ?)`
         )
         .bind(crypto.randomUUID(), runRecord.id, profileId, period, getTrendTotalPages(profile.resultCount), now)
     );
     await batchInChunks(db, inserts, 50);
   }
 
-  await run(db, "UPDATE trend_profiles SET latest_run_id = ?, updated_at = ? WHERE id = ?", [runRecord.id, now, profileId]);
+  await run(db, "UPDATE trend_profiles SET latest_run_id = ?, last_collected_period = COALESCE(?, last_collected_period), updated_at = ? WHERE id = ?", [
+    runRecord.id,
+    cachedPlans.length && !uncachedPeriods.length ? latestCollectiblePeriod : cachedPlans.at(-1)?.period ?? null,
+    now,
+    profileId
+  ]);
 
   return {
     ok: true as const,
@@ -1061,16 +1185,89 @@ async function syncProfileToSheets(env: Env, profileId: string) {
   };
 }
 
-async function processNextQueuedRun(env: Env, _ctx: ExecutionContext) {
+async function processQueuedRunBatch(
+  env: Env,
+  options: { runId?: string; maxTasks?: number; maxWallMs?: number } = {}
+) {
+  const maxTasks = options.maxTasks ?? PROCESS_BATCH_MAX_TASKS;
+  const maxWallMs = options.maxWallMs ?? PROCESS_BATCH_MAX_WALL_MS;
+  const startedAt = Date.now();
+  const sessionRef: NaverSessionRef = {};
+  const results: Json[] = [];
+
+  for (let index = 0; index < maxTasks; index += 1) {
+    if (Date.now() - startedAt >= maxWallMs) {
+      break;
+    }
+
+    const result = await processNextQueuedRun(env, {
+      runId: options.runId,
+      sessionRef
+    });
+    results.push(result as Json);
+
+    if (!result.processed) {
+      break;
+    }
+
+    if (options.runId) {
+      const runRow = await one<TrendCollectionRunRow>(dbFor(env), "SELECT * FROM trend_runs WHERE id = ?", [options.runId]);
+      if (!runRow || !["queued", "running"].includes(runRow.status)) {
+        break;
+      }
+    }
+  }
+
+  return {
+    ok: true as const,
+    processed: results.some((result) => Boolean((result as { processed?: boolean }).processed)),
+    processedTasks: results.filter((result) => Boolean((result as { processed?: boolean }).processed)).length,
+    durationMs: Date.now() - startedAt,
+    results
+  };
+}
+
+async function shouldKickQueuedProcessing(db: D1Database, runId?: string) {
+  const processableRuns = await scalar<number>(
+    db,
+    runId
+      ? `SELECT COUNT(*)
+         FROM trend_runs tr
+         WHERE tr.id = ?
+           AND tr.status IN ('queued', 'running')
+           AND EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'pending')
+           AND NOT EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'running')`
+      : `SELECT COUNT(*)
+         FROM trend_runs tr
+         WHERE tr.status IN ('queued', 'running')
+           AND EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'pending')
+           AND NOT EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'running')`,
+    runId ? [runId] : []
+  );
+
+  return Number(processableRuns ?? 0) > 0;
+}
+
+async function processNextQueuedRun(
+  env: Env,
+  options: { runId?: string; sessionRef?: NaverSessionRef } = {}
+) {
   const db = dbFor(env);
   const candidateRunRow = await one<TrendCollectionRunRow>(
     db,
-    `SELECT * FROM trend_runs
-     WHERE status IN ('queued', 'running')
-       AND id IN (SELECT run_id FROM trend_tasks WHERE status = 'pending')
-     ORDER BY updated_at DESC
-     LIMIT 1`
-  , []);
+    options.runId
+      ? `SELECT * FROM trend_runs
+         WHERE id = ?
+           AND status IN ('queued', 'running')
+           AND id IN (SELECT run_id FROM trend_tasks WHERE status = 'pending')
+         LIMIT 1`
+      : `SELECT * FROM trend_runs
+         WHERE status IN ('queued', 'running')
+           AND id IN (SELECT run_id FROM trend_tasks WHERE status = 'pending')
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+    options.runId ? [options.runId] : []
+  );
 
   if (!candidateRunRow) {
     return {
@@ -1129,8 +1326,18 @@ async function processNextQueuedRun(env: Env, _ctx: ExecutionContext) {
   const profile = mapProfile(profileRow);
 
   try {
+    const cachedRanks = await readCachedMonthlyRanks(db, profile, nextTaskRow.period);
+    const source: TrendCollectionTaskSource = cachedRanks ? "cache" : "naver";
+
+    await run(db, "UPDATE trend_tasks SET source = ?, updated_at = ? WHERE id = ?", [source, nowIso(), nextTaskRow.id]);
+
+    if (!cachedRanks && !options.sessionRef?.jar) {
+      options.sessionRef = options.sessionRef ?? {};
+      options.sessionRef.jar = await bootstrapSession();
+    }
+
     const ranks =
-      (await readCachedMonthlyRanks(db, profile, nextTaskRow.period)) ??
+      cachedRanks ??
       (await collectMonthlyRanks({
         categoryCid: profile.categoryCid,
         period: nextTaskRow.period,
@@ -1138,6 +1345,7 @@ async function processNextQueuedRun(env: Env, _ctx: ExecutionContext) {
         genders: profile.genders,
         ages: profile.ages,
         resultCount: profile.resultCount,
+        sessionJar: options.sessionRef?.jar,
         onPageCollected: async (page) => {
           await run(
             db,
@@ -1209,9 +1417,9 @@ async function processNextQueuedRun(env: Env, _ctx: ExecutionContext) {
     await run(
       db,
       `UPDATE trend_tasks
-       SET status = 'completed', completed_pages = ?, completed_at = ?, updated_at = ?
+       SET status = 'completed', completed_pages = ?, source = ?, completed_at = ?, updated_at = ?
        WHERE id = ?`,
-      [getTrendTotalPages(profile.resultCount), collectedAt, collectedAt, nextTaskRow.id]
+      [getTrendTotalPages(profile.resultCount), source, collectedAt, collectedAt, nextTaskRow.id]
     );
 
     await run(
@@ -1300,7 +1508,9 @@ async function refreshRunState(db: D1Database, runId: string) {
   await run(
     db,
     `UPDATE trend_runs
-     SET status = ?, total_tasks = ?, completed_tasks = ?, failed_tasks = ?, total_snapshots = ?, completed_at = ?, cancelled_at = NULL, failure_reason = ?, updated_at = ?
+     SET status = ?, total_tasks = ?, completed_tasks = ?, failed_tasks = ?, total_snapshots = ?, completed_at = ?, cancelled_at = NULL, failure_reason = ?,
+         confidence_score = NULL, analysis_summary_json = NULL, analysis_cards_json = NULL, analysis_cached_at = NULL,
+         updated_at = ?
      WHERE id = ?`,
     [status, total, completed, failed, snapshots, completedAt, failureReason, now, runId]
   );
@@ -1336,6 +1546,18 @@ async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<
   const runningTask =
     [...tasks].find((task) => task.status === "running") ??
     [...tasks].find((task) => task.status === "pending");
+  const cacheCompletedTasks = tasks.filter((task) => task.status === "completed" && task.source === "cache").length;
+  const naverCompletedTasks = tasks.filter((task) => task.status === "completed" && task.source === "naver").length;
+  const processingMode =
+    run.status === "completed"
+      ? "idle"
+      : runningTask?.source === "cache"
+        ? "cache"
+        : runningTask?.source === "naver"
+          ? "naver"
+          : cacheCompletedTasks > naverCompletedTasks
+            ? "cache"
+            : "naver";
   const completedDurations = tasks
     .filter((task) => task.status === "completed" && task.startedAt && task.completedAt)
     .map((task) => Math.max(1, (new Date(task.completedAt!).getTime() - new Date(task.startedAt!).getTime()) / 1000));
@@ -1353,7 +1575,12 @@ async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<
       )
     : undefined;
   const analysisReady = run.status === "completed" && completedPeriodCount >= expectedPeriods.length;
-  const analysis = analysisReady ? buildTrendAnalysis(profile, profileSnapshots) : null;
+  const cachedAnalysis = analysisReady ? await readCachedRunAnalysis(db, run.id, expectedPeriods.length) : null;
+  const analysis =
+    cachedAnalysis ??
+    (analysisReady
+      ? await buildAndCacheRunAnalysis(db, run.id, profile, profileSnapshots)
+      : null);
 
   return {
     ...run,
@@ -1365,6 +1592,9 @@ async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<
     currentPage,
     latestCompletedPeriod,
     remainingTasks,
+    cacheCompletedTasks,
+    naverCompletedTasks,
+    processingMode: cachedAnalysis ? "reused-report" : processingMode,
     averageTaskSeconds,
     etaMinutes,
     estimatedCompletionAt,
@@ -1375,6 +1605,66 @@ async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<
     analysisSummary: analysis?.summary,
     analysisCards: analysis?.cards ?? []
   };
+}
+
+async function readCachedRunAnalysis(db: D1Database, runId: string, expectedObservedMonths: number) {
+  const row = await one<{
+    confidence_score: number | null;
+    analysis_summary_json: string | null;
+    analysis_cards_json: string | null;
+  }>(
+    db,
+    "SELECT confidence_score, analysis_summary_json, analysis_cards_json FROM trend_runs WHERE id = ?",
+    [runId]
+  );
+
+  if (!row?.analysis_summary_json || !row.analysis_cards_json) {
+    return null;
+  }
+
+  const summary = parseJson<TrendAnalysisSummary | null>(row.analysis_summary_json, null);
+  const cards = parseJson<TrendAnalysisCard[]>(row.analysis_cards_json, []);
+
+  if (!summary || !cards.length || summary.observedMonths !== expectedObservedMonths) {
+    return null;
+  }
+
+  return {
+    confidenceScore: Number(row.confidence_score ?? 0),
+    summary,
+    cards
+  };
+}
+
+async function buildAndCacheRunAnalysis(
+  db: D1Database,
+  runId: string,
+  profile: TrendProfile,
+  snapshots: TrendKeywordSnapshot[]
+) {
+  const analysis = buildTrendAnalysis(profile, snapshots);
+  const cachedAt = nowIso();
+
+  await run(
+    db,
+    `UPDATE trend_runs
+     SET confidence_score = ?,
+         analysis_summary_json = ?,
+         analysis_cards_json = ?,
+         analysis_cached_at = ?,
+         updated_at = ?
+     WHERE id = ?`,
+    [
+      analysis.confidenceScore,
+      JSON.stringify(analysis.summary),
+      JSON.stringify(analysis.cards),
+      cachedAt,
+      cachedAt,
+      runId
+    ]
+  );
+
+  return analysis;
 }
 
 async function fetchCategoryChildren(cid: number) {
@@ -1396,9 +1686,10 @@ async function collectMonthlyRanks(input: {
   genders: TrendGenderCode[];
   ages: TrendAgeCode[];
   resultCount: TrendResultCount;
+  sessionJar?: Map<string, string>;
   onPageCollected?: (page: number) => Promise<void>;
 }) {
-  const jar = await bootstrapSession();
+  const jar = input.sessionJar ?? (await bootstrapSession());
   const { startDate, endDate } = monthPeriodToDateRange(input.period);
   const pages: NaverKeywordRankPage[] = [];
   const totalPages = getTrendTotalPages(input.resultCount);
@@ -1930,6 +2221,7 @@ function mapTask(row: TrendTaskRow): TrendCollectionTask {
     completedPages: Number(row.completed_pages),
     totalPages: Number(row.total_pages),
     retryCount: Number(row.retry_count),
+    source: row.source === "cache" || row.source === "naver" ? row.source : undefined,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
     failureReason: row.failure_reason ?? undefined,
@@ -2036,6 +2328,28 @@ async function applySchemaChanges(db: D1Database) {
   if (!runColumns.has("cancelled_at")) {
     await run(db, "ALTER TABLE trend_runs ADD COLUMN cancelled_at TEXT");
   }
+
+  if (!runColumns.has("confidence_score")) {
+    await run(db, "ALTER TABLE trend_runs ADD COLUMN confidence_score REAL");
+  }
+
+  if (!runColumns.has("analysis_summary_json")) {
+    await run(db, "ALTER TABLE trend_runs ADD COLUMN analysis_summary_json TEXT");
+  }
+
+  if (!runColumns.has("analysis_cards_json")) {
+    await run(db, "ALTER TABLE trend_runs ADD COLUMN analysis_cards_json TEXT");
+  }
+
+  if (!runColumns.has("analysis_cached_at")) {
+    await run(db, "ALTER TABLE trend_runs ADD COLUMN analysis_cached_at TEXT");
+  }
+
+  const taskColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(trend_tasks)")).map((column) => column.name));
+
+  if (!taskColumns.has("source")) {
+    await run(db, "ALTER TABLE trend_tasks ADD COLUMN source TEXT");
+  }
 }
 
 interface TrendProfileRow {
@@ -2080,6 +2394,10 @@ interface TrendCollectionRunRow {
   started_at: string | null;
   completed_at: string | null;
   cancelled_at: string | null;
+  confidence_score?: number | null;
+  analysis_summary_json?: string | null;
+  analysis_cards_json?: string | null;
+  analysis_cached_at?: string | null;
   failure_reason: string | null;
   created_at: string;
   updated_at: string;
@@ -2094,6 +2412,7 @@ interface TrendTaskRow {
   completed_pages: number;
   total_pages: number;
   retry_count: number;
+  source?: string | null;
   started_at: string | null;
   completed_at: string | null;
   failure_reason: string | null;

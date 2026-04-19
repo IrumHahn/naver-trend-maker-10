@@ -673,7 +673,7 @@ export default function SourcingAdminPage() {
         <header className={styles.header}>
           <div className={styles.headerCopy}>
             <p className={styles.eyebrow}>HANIRUM</p>
-            <h1 className={styles.title}>한이룸의 네이버 트랜드 마법사</h1>
+            <h1 className={styles.title}>한이룸의 네이버 트렌드 마법사 1.0</h1>
             <p className={styles.description}>
               장기간 월별 인기검색어를 취합해 앞으로 준비해야 할 키워드, 조심해야 할 키워드, 시즌형 수요를
               더 입체적으로 보여줍니다.
@@ -1126,6 +1126,13 @@ export default function SourcingAdminPage() {
                     <div className={styles.pillRow}>
                       <span className={styles.summaryPill}>수집 기준 {visibleRun?.profile.resultCount ?? form.resultCount}개</span>
                       <span className={styles.summaryPill}>기준 기간 {summaryPeriodLabel}</span>
+                      {visibleRun ? (
+                        <>
+                          <span className={styles.summaryPill}>{processingModeLabel(visibleRun.processingMode)}</span>
+                          <span className={styles.summaryPill}>캐시 {visibleRun.cacheCompletedTasks ?? 0}개월</span>
+                          <span className={styles.summaryPill}>네이버 {visibleRun.naverCompletedTasks ?? 0}개월</span>
+                        </>
+                      ) : null}
                       {visibleRun?.profile.excludeBrandProducts || form.excludeBrandProducts ? (
                         <span className={styles.summaryPill}>브랜드 제품 제외 적용</span>
                       ) : null}
@@ -1167,6 +1174,11 @@ export default function SourcingAdminPage() {
                     label="최근 완료 월"
                     value={visibleRun?.latestCompletedPeriod ?? "대기"}
                     hint={visibleRun?.analysisReady ? "전체 취합 완료" : "월별 완료 기준"}
+                  />
+                  <ProgressStat
+                    label="처리 방식"
+                    value={visibleRun ? processingModeLabel(visibleRun.processingMode) : "대기"}
+                    hint={visibleRun ? processingModeHint(visibleRun.processingMode) : "분석 시작 후 표시"}
                   />
                 </div>
 
@@ -2279,6 +2291,36 @@ function runBadgeClass(status: TrendRunDetail["status"]) {
       return styles.badgeDanger;
     default:
       return styles.badgeMuted;
+  }
+}
+
+function processingModeLabel(mode?: TrendRunDetail["processingMode"]) {
+  switch (mode) {
+    case "cache":
+      return "캐시 사용 중";
+    case "naver":
+      return "네이버 수집 중";
+    case "reused-report":
+      return "리포트 재사용";
+    case "idle":
+      return "수집 완료";
+    default:
+      return "대기";
+  }
+}
+
+function processingModeHint(mode?: TrendRunDetail["processingMode"]) {
+  switch (mode) {
+    case "cache":
+      return "저장된 월 데이터를 즉시 반영";
+    case "naver":
+      return "누락 월만 순차 수집";
+    case "reused-report":
+      return "완료 리포트 캐시 반환";
+    case "idle":
+      return "추가 수집 없음";
+    default:
+      return "처리 경로 대기";
   }
 }
 

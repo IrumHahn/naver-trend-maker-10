@@ -7,6 +7,7 @@ export type TrendResultCount = 20 | 40;
 export type TrendProfileStatus = "active" | "paused";
 export type TrendCollectionRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type TrendCollectionTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type TrendCollectionTaskSource = "cache" | "naver";
 export type TrendSyncStatus = "idle" | "syncing" | "synced" | "failed";
 
 export interface TrendCategoryNode {
@@ -58,6 +59,7 @@ export interface TrendCollectionTask {
   completedPages: number;
   totalPages: number;
   retryCount: number;
+  source?: TrendCollectionTaskSource;
   startedAt?: string;
   completedAt?: string;
   failureReason?: string;
@@ -241,6 +243,9 @@ export interface TrendRunDetail extends TrendCollectionRun {
   currentPage?: number;
   latestCompletedPeriod?: string;
   remainingTasks: number;
+  cacheCompletedTasks?: number;
+  naverCompletedTasks?: number;
+  processingMode?: "idle" | "cache" | "naver" | "reused-report";
   averageTaskSeconds?: number;
   etaMinutes?: number;
   estimatedCompletionAt?: string;
