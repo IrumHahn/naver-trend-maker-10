@@ -116,8 +116,8 @@ type MonthlyTarget = {
 };
 
 export function buildTrendAnalysis(profile: TrendProfile, snapshots: TrendKeywordSnapshot[]) {
-  const latestPeriod = latestSnapshotPeriod(snapshots);
-  const observedPeriods = latestPeriod ? listMonthlyPeriods(profile.startPeriod, latestPeriod) : [];
+  const latestPeriod = latestSnapshotPeriod(snapshots) ?? profile.endPeriod;
+  const observedPeriods = listMonthlyPeriods(profile.startPeriod, profile.endPeriod);
   const normalizedSnapshots = snapshots
     .filter((snapshot) => snapshot.rank <= profile.resultCount)
     .sort((left, right) => left.period.localeCompare(right.period) || left.rank - right.rank);

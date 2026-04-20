@@ -80,6 +80,9 @@ const JSON_HEADERS = {
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const PROCESS_BATCH_MAX_TASKS = 8;
 const PROCESS_BATCH_MAX_WALL_MS = 25_000;
+const NAVER_INTER_MONTH_DELAY_MS = 650;
+const NAVER_INTER_MONTH_DELAY_JITTER_MS = 450;
+const TASK_AUTO_RETRY_LIMIT = 4;
 let schemaReadyPromise: Promise<void> | null = null;
 
 type NaverSessionRef = {
@@ -107,6 +110,7 @@ export default {
       }
 
       if (request.method === "GET" && pathname === "/v1/trends/admin/board") {
+        await recoverRetryableFailedTasks(env.DB);
         const board = await getTrendAdminBoard(env.DB);
 
         if (await shouldKickQueuedProcessing(env.DB)) {
@@ -145,6 +149,7 @@ export default {
 
       const runMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)$/);
       if (request.method === "GET" && runMatch) {
+        await recoverRetryableFailedTasks(env.DB, runMatch[1]);
         const response = await getTrendRun(env.DB, runMatch[1]);
 
         if (response.ok && (await shouldKickQueuedProcessing(env.DB, runMatch[1]))) {
@@ -187,6 +192,7 @@ export default {
       }
 
       if (request.method === "POST" && pathname === "/v1/trends/worker/process-next") {
+        await recoverRetryableFailedTasks(env.DB);
         return respondJson(await processQueuedRunBatch(env));
       }
 
@@ -212,6 +218,7 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     await ensureSchema(env.DB);
+    await recoverRetryableFailedTasks(env.DB);
     ctx.waitUntil(processQueuedRunBatch(env, { maxTasks: PROCESS_BATCH_MAX_TASKS * 2, maxWallMs: 55_000 }));
   }
 };
@@ -592,14 +599,14 @@ async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
 async function findReusableCompletedRun(db: D1Database, profile: TrendProfile): Promise<TrendCollectionRun | null> {
   const latestCollectiblePeriod = getLatestCollectibleTrendPeriod();
   const periods = listMonthlyPeriods(profile.startPeriod, latestCollectiblePeriod);
-  const completedRows = await all<{ period: string; count: number }>(
+  const completedRows = await all<{ period: string }>(
     db,
-    "SELECT period, COUNT(*) as count FROM trend_snapshots WHERE profile_id = ? AND rank <= ? GROUP BY period",
-    [profile.id, profile.resultCount]
+    "SELECT DISTINCT period FROM trend_tasks WHERE profile_id = ? AND status = 'completed'",
+    [profile.id]
   );
-  const completedMap = new Map(completedRows.map((row) => [row.period, Number(row.count) >= profile.resultCount]));
+  const completedPeriods = new Set(completedRows.map((row) => row.period));
 
-  if (!periods.length || periods.some((period) => !completedMap.get(period))) {
+  if (!periods.length || periods.some((period) => !completedPeriods.has(period))) {
     return null;
   }
 
@@ -629,8 +636,8 @@ async function findReusableCompletedRun(db: D1Database, profile: TrendProfile): 
         .prepare(
           `INSERT INTO trend_tasks (
             id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
-            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
-          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, ?)`
+            source, started_at, completed_at, next_attempt_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, NULL, ?)`
         )
         .bind(
           crypto.randomUUID(),
@@ -735,6 +742,7 @@ async function cancelTrendRun(db: D1Database, runId: string) {
      SET status = 'cancelled',
          completed_pages = 0,
          completed_at = NULL,
+         next_attempt_at = NULL,
          failure_reason = COALESCE(failure_reason, '사용자가 취합을 중지했습니다.'),
          failure_snippet = COALESCE(failure_snippet, 'cancelled by operator'),
          updated_at = ?
@@ -936,6 +944,7 @@ async function retryFailedTasks(db: D1Database, runId: string) {
          completed_pages = 0,
          started_at = NULL,
          completed_at = NULL,
+         next_attempt_at = NULL,
          failure_reason = NULL,
          failure_snippet = NULL,
          updated_at = ?
@@ -986,19 +995,19 @@ async function startBackfill(db: D1Database, profileId: string) {
   }
 
   const periods = listMonthlyPeriods(profile.startPeriod, latestCollectiblePeriod);
-  const completedRows = await all<{ period: string; count: number }>(
+  const completedRows = await all<{ period: string }>(
     db,
-    "SELECT period, COUNT(*) as count FROM trend_snapshots WHERE profile_id = ? AND rank <= ? GROUP BY period",
-    [profileId, profile.resultCount]
+    "SELECT DISTINCT period FROM trend_tasks WHERE profile_id = ? AND status = 'completed'",
+    [profileId]
   );
-  const completedMap = new Map(completedRows.map((row) => [row.period, Number(row.count) >= profile.resultCount]));
+  const completedPeriods = new Set(completedRows.map((row) => row.period));
   const pendingRows = await all<{ period: string }>(
     db,
     "SELECT DISTINCT period FROM trend_tasks WHERE profile_id = ? AND status IN ('pending', 'running')",
     [profileId]
   );
   const pendingPeriods = new Set(pendingRows.map((row) => row.period));
-  const targetPeriods = periods.filter((period) => !completedMap.get(period) && !pendingPeriods.has(period));
+  const targetPeriods = periods.filter((period) => !completedPeriods.has(period) && !pendingPeriods.has(period));
   const cachedPlans: Array<{ period: string; taskId: string; ranks: NaverKeywordRankItem[] }> = [];
   const uncachedPeriods: string[] = [];
 
@@ -1018,6 +1027,7 @@ async function startBackfill(db: D1Database, profileId: string) {
 
   const totalTasks = cachedPlans.length + uncachedPeriods.length;
   const completedTasks = cachedPlans.length;
+  const cachedSnapshotCount = cachedPlans.reduce((sum, plan) => sum + plan.ranks.length, 0);
 
   const runRecord: TrendCollectionRun = {
     id: crypto.randomUUID(),
@@ -1030,7 +1040,7 @@ async function startBackfill(db: D1Database, profileId: string) {
     totalTasks,
     completedTasks,
     failedTasks: 0,
-    totalSnapshots: completedTasks * profile.resultCount,
+    totalSnapshots: cachedSnapshotCount,
     sheetUrl: undefined,
     startedAt: completedTasks > 0 ? now : undefined,
     completedAt: uncachedPeriods.length ? undefined : now,
@@ -1074,8 +1084,8 @@ async function startBackfill(db: D1Database, profileId: string) {
         .prepare(
           `INSERT INTO trend_tasks (
             id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
-            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
-          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, ?)`
+            source, started_at, completed_at, next_attempt_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 0, 'cache', ?, ?, NULL, NULL, NULL, ?)`
         )
         .bind(
           plan.taskId,
@@ -1132,8 +1142,8 @@ async function startBackfill(db: D1Database, profileId: string) {
         .prepare(
           `INSERT INTO trend_tasks (
             id, run_id, profile_id, period, status, completed_pages, total_pages, retry_count,
-            source, started_at, completed_at, failure_reason, failure_snippet, updated_at
-          ) VALUES (?, ?, ?, ?, 'pending', 0, ?, 0, NULL, NULL, NULL, NULL, NULL, ?)`
+            source, started_at, completed_at, next_attempt_at, failure_reason, failure_snippet, updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', 0, ?, 0, NULL, NULL, NULL, NULL, NULL, NULL, ?)`
         )
         .bind(crypto.randomUUID(), runRecord.id, profileId, period, getTrendTotalPages(profile.resultCount), now)
     );
@@ -1210,6 +1220,10 @@ async function processQueuedRunBatch(
       break;
     }
 
+    if ((result as { source?: string }).source === "naver" && index < maxTasks - 1) {
+      await sleep(NAVER_INTER_MONTH_DELAY_MS + Math.round(Math.random() * NAVER_INTER_MONTH_DELAY_JITTER_MS));
+    }
+
     if (options.runId) {
       const runRow = await one<TrendCollectionRunRow>(dbFor(env), "SELECT * FROM trend_runs WHERE id = ?", [options.runId]);
       if (!runRow || !["queued", "running"].includes(runRow.status)) {
@@ -1227,7 +1241,60 @@ async function processQueuedRunBatch(
   };
 }
 
+async function recoverRetryableFailedTasks(db: D1Database, runId?: string) {
+  const now = nowIso();
+
+  await run(
+    db,
+    runId
+      ? `UPDATE trend_tasks
+         SET status = 'pending',
+             retry_count = retry_count + 1,
+             completed_pages = 0,
+             started_at = NULL,
+             completed_at = NULL,
+             next_attempt_at = NULL,
+             updated_at = ?
+         WHERE run_id = ?
+           AND status = 'failed'
+           AND retry_count < ?`
+      : `UPDATE trend_tasks
+         SET status = 'pending',
+             retry_count = retry_count + 1,
+             completed_pages = 0,
+             started_at = NULL,
+             completed_at = NULL,
+             next_attempt_at = NULL,
+             updated_at = ?
+         WHERE status = 'failed'
+           AND retry_count < ?`,
+    runId ? [now, runId, TASK_AUTO_RETRY_LIMIT] : [now, TASK_AUTO_RETRY_LIMIT]
+  );
+
+  await run(
+    db,
+    runId
+      ? `UPDATE trend_runs
+         SET status = 'queued',
+             failed_tasks = 0,
+             completed_at = NULL,
+             failure_reason = NULL,
+             updated_at = ?
+         WHERE id = ?
+           AND EXISTS (SELECT 1 FROM trend_tasks WHERE run_id = ? AND status = 'pending')`
+      : `UPDATE trend_runs
+         SET status = 'queued',
+             failed_tasks = 0,
+             completed_at = NULL,
+             failure_reason = NULL,
+             updated_at = ?
+         WHERE EXISTS (SELECT 1 FROM trend_tasks WHERE run_id = trend_runs.id AND status = 'pending')`,
+    runId ? [now, runId, runId] : [now]
+  );
+}
+
 async function shouldKickQueuedProcessing(db: D1Database, runId?: string) {
+  const now = nowIso();
   const processableRuns = await scalar<number>(
     db,
     runId
@@ -1235,14 +1302,26 @@ async function shouldKickQueuedProcessing(db: D1Database, runId?: string) {
          FROM trend_runs tr
          WHERE tr.id = ?
            AND tr.status IN ('queued', 'running')
-           AND EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'pending')
+           AND EXISTS (
+             SELECT 1
+             FROM trend_tasks tt
+             WHERE tt.run_id = tr.id
+               AND tt.status = 'pending'
+               AND (tt.next_attempt_at IS NULL OR tt.next_attempt_at <= ?)
+           )
            AND NOT EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'running')`
       : `SELECT COUNT(*)
          FROM trend_runs tr
          WHERE tr.status IN ('queued', 'running')
-           AND EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'pending')
+           AND EXISTS (
+             SELECT 1
+             FROM trend_tasks tt
+             WHERE tt.run_id = tr.id
+               AND tt.status = 'pending'
+               AND (tt.next_attempt_at IS NULL OR tt.next_attempt_at <= ?)
+           )
            AND NOT EXISTS (SELECT 1 FROM trend_tasks tt WHERE tt.run_id = tr.id AND tt.status = 'running')`,
-    runId ? [runId] : []
+    runId ? [runId, now] : [now]
   );
 
   return Number(processableRuns ?? 0) > 0;
@@ -1253,20 +1332,31 @@ async function processNextQueuedRun(
   options: { runId?: string; sessionRef?: NaverSessionRef } = {}
 ) {
   const db = dbFor(env);
+  const now = nowIso();
   const candidateRunRow = await one<TrendCollectionRunRow>(
     db,
     options.runId
       ? `SELECT * FROM trend_runs
          WHERE id = ?
            AND status IN ('queued', 'running')
-           AND id IN (SELECT run_id FROM trend_tasks WHERE status = 'pending')
+           AND id IN (
+             SELECT run_id
+             FROM trend_tasks
+             WHERE status = 'pending'
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           )
          LIMIT 1`
       : `SELECT * FROM trend_runs
          WHERE status IN ('queued', 'running')
-           AND id IN (SELECT run_id FROM trend_tasks WHERE status = 'pending')
+           AND id IN (
+             SELECT run_id
+             FROM trend_tasks
+             WHERE status = 'pending'
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           )
          ORDER BY updated_at DESC
          LIMIT 1`,
-    options.runId ? [options.runId] : []
+    options.runId ? [options.runId, now] : [now]
   );
 
   if (!candidateRunRow) {
@@ -1278,8 +1368,14 @@ async function processNextQueuedRun(
 
   const nextTaskRow = await one<TrendTaskRow>(
     db,
-    "SELECT * FROM trend_tasks WHERE run_id = ? AND status = 'pending' ORDER BY period ASC LIMIT 1",
-    [candidateRunRow.id]
+    `SELECT *
+     FROM trend_tasks
+     WHERE run_id = ?
+       AND status = 'pending'
+       AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+     ORDER BY period ASC
+     LIMIT 1`,
+    [candidateRunRow.id, nowIso()]
   );
 
   if (!nextTaskRow) {
@@ -1295,7 +1391,7 @@ async function processNextQueuedRun(
     const now = nowIso();
     await run(
       db,
-      "UPDATE trend_tasks SET status = 'failed', failure_reason = ?, failure_snippet = ?, updated_at = ? WHERE id = ?",
+      "UPDATE trend_tasks SET status = 'failed', next_attempt_at = NULL, failure_reason = ?, failure_snippet = ?, updated_at = ? WHERE id = ?",
       ["Trend profile is missing.", "Missing profile", now, nextTaskRow.id]
     );
     await refreshRunState(db, candidateRunRow.id);
@@ -1311,7 +1407,6 @@ async function processNextQueuedRun(
     };
   }
 
-  const now = nowIso();
   await run(
     db,
     "UPDATE trend_runs SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
@@ -1319,7 +1414,7 @@ async function processNextQueuedRun(
   );
   await run(
     db,
-    "UPDATE trend_tasks SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+    "UPDATE trend_tasks SET status = 'running', started_at = ?, next_attempt_at = NULL, updated_at = ? WHERE id = ?",
     [now, now, nextTaskRow.id]
   );
 
@@ -1417,7 +1512,7 @@ async function processNextQueuedRun(
     await run(
       db,
       `UPDATE trend_tasks
-       SET status = 'completed', completed_pages = ?, source = ?, completed_at = ?, updated_at = ?
+       SET status = 'completed', completed_pages = ?, source = ?, next_attempt_at = NULL, completed_at = ?, updated_at = ?
        WHERE id = ?`,
       [getTrendTotalPages(profile.resultCount), source, collectedAt, collectedAt, nextTaskRow.id]
     );
@@ -1433,6 +1528,7 @@ async function processNextQueuedRun(
     return {
       ok: true as const,
       processed: true,
+      source,
       runId: candidateRunRow.id,
       taskId: nextTaskRow.id,
       period: nextTaskRow.period
@@ -1441,13 +1537,46 @@ async function processNextQueuedRun(
     const message = error instanceof Error ? error.message : "Naver collection failed.";
     const snippet = summarizeFailureSnippet(String(error));
     const failedAt = nowIso();
+    const nextRetryCount = Number(nextTaskRow.retry_count ?? 0) + 1;
+
+    if (isRetryableCollectionError(message) && nextRetryCount <= TASK_AUTO_RETRY_LIMIT) {
+      const nextAttemptAt = isoAfterSeconds(getRetryDelaySeconds(nextRetryCount));
+
+      await run(
+        db,
+        `UPDATE trend_tasks
+         SET status = 'pending',
+             retry_count = ?,
+             completed_pages = 0,
+             started_at = NULL,
+             completed_at = NULL,
+             next_attempt_at = ?,
+             failure_reason = ?,
+             failure_snippet = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [nextRetryCount, nextAttemptAt, message, snippet, failedAt, nextTaskRow.id]
+      );
+      await refreshRunState(db, candidateRunRow.id);
+
+      return {
+        ok: true as const,
+        processed: true,
+        retried: true,
+        source: "naver",
+        nextAttemptAt,
+        runId: candidateRunRow.id,
+        taskId: nextTaskRow.id,
+        period: nextTaskRow.period
+      };
+    }
 
     await run(
       db,
       `UPDATE trend_tasks
-       SET status = 'failed', failure_reason = ?, failure_snippet = ?, updated_at = ?
+       SET status = 'failed', retry_count = ?, next_attempt_at = NULL, failure_reason = ?, failure_snippet = ?, updated_at = ?
        WHERE id = ?`,
-      [message, snippet, failedAt, nextTaskRow.id]
+      [nextRetryCount, message, snippet, failedAt, nextTaskRow.id]
     );
     await refreshRunState(db, candidateRunRow.id);
     await run(db, "UPDATE trend_profiles SET updated_at = ? WHERE id = ?", [failedAt, profile.id]);
@@ -1519,6 +1648,19 @@ async function refreshRunState(db: D1Database, runId: string) {
   return mapRun(row!);
 }
 
+function isRetryableCollectionError(message: string) {
+  return /Naver|No ranks|Expected|Duplicate|Rank range|JSON|HTML|fetch|status\s(?:429|500|502|503|504)/i.test(message);
+}
+
+function getRetryDelaySeconds(retryCount: number) {
+  const baseSeconds = Math.min(180, 18 * 2 ** Math.max(0, retryCount - 1));
+  return baseSeconds + Math.round(Math.random() * 12);
+}
+
+function isoAfterSeconds(seconds: number) {
+  return new Date(Date.now() + seconds * 1000).toISOString();
+}
+
 async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<TrendRunDetail> {
   const profileRow = await one<TrendProfileRow>(db, "SELECT * FROM trend_profiles WHERE id = ?", [run.profileId]);
   const profile = mapProfile(profileRow!);
@@ -1539,7 +1681,7 @@ async function buildRunDetail(db: D1Database, run: TrendCollectionRun): Promise<
     [...new Set(tasks.filter((task) => task.status === "completed").map((task) => task.period))].sort((left, right) => right.localeCompare(left))[0] ??
     [...new Set(profileSnapshots.map((snapshot) => snapshot.period))].sort((left, right) => right.localeCompare(left))[0];
   const expectedPeriods = listMonthlyPeriods(profile.startPeriod, profile.endPeriod);
-  const completedPeriodCount = new Set(profileSnapshots.map((snapshot) => snapshot.period)).size;
+  const completedPeriodCount = new Set(tasks.filter((task) => task.status === "completed").map((task) => task.period)).size;
   const snapshotsPreview = latestCompletedPeriod
     ? visibleSnapshots.filter((snapshot) => snapshot.period === latestCompletedPeriod).slice(0, TREND_PAGE_SIZE)
     : [];
@@ -1712,8 +1854,12 @@ async function collectMonthlyRanks(input: {
       body
     });
 
-    if (!Array.isArray(payload.ranks) || payload.ranks.length === 0) {
-      throw new Error(`No ranks were returned for ${input.period} page ${page}.`);
+    if (!Array.isArray(payload.ranks)) {
+      throw new Error(`Naver returned an invalid rank payload for ${input.period} page ${page}.`);
+    }
+
+    if (payload.ranks.length === 0) {
+      break;
     }
 
     pages.push(payload);
@@ -1747,7 +1893,7 @@ async function readCachedMonthlyRanks(db: D1Database, profile: TrendProfile, per
        AND ts.rank <= ?
        AND tp.id != ?
      GROUP BY tp.id
-     HAVING COUNT(*) >= ?
+     HAVING COUNT(*) > 0
      ORDER BY MAX(ts.collected_at) DESC
      LIMIT 1`,
     [
@@ -1760,8 +1906,7 @@ async function readCachedMonthlyRanks(db: D1Database, profile: TrendProfile, per
       profile.excludeBrandProducts ? 1 : 0,
       json(profile.customExcludedTerms),
       profile.resultCount,
-      profile.id,
-      profile.resultCount
+      profile.id
     ]
   );
 
@@ -1780,7 +1925,7 @@ async function readCachedMonthlyRanks(db: D1Database, profile: TrendProfile, per
     [cachedSource.profile_id, period, profile.resultCount]
   );
 
-  if (rows.length !== profile.resultCount) {
+  if (!rows.length) {
     return null;
   }
 
@@ -2101,22 +2246,19 @@ function monthPeriodToDateRange(period: string) {
 }
 
 function mergeKeywordRankPages(pages: NaverKeywordRankPage[], expectedCount: TrendResultCount) {
-  const merged = pages.flatMap((page) => page.ranks).sort((left, right) => left.rank - right.rank);
+  const byRank = new Map<number, NaverKeywordRankItem>();
 
-  if (merged.length !== expectedCount) {
-    throw new Error(`Expected ${expectedCount} keywords but received ${merged.length}.`);
-  }
+  pages
+    .flatMap((page) => page.ranks)
+    .filter((item) => item.rank >= 1 && item.rank <= expectedCount)
+    .sort((left, right) => left.rank - right.rank)
+    .forEach((item) => {
+      if (!byRank.has(item.rank)) {
+        byRank.set(item.rank, item);
+      }
+    });
 
-  const uniqueRanks = new Set(merged.map((item) => item.rank));
-  if (uniqueRanks.size !== expectedCount) {
-    throw new Error("Duplicate ranks detected while merging keyword pages.");
-  }
-
-  if (merged[0]?.rank !== 1 || merged[merged.length - 1]?.rank !== expectedCount) {
-    throw new Error("Rank range is incomplete.");
-  }
-
-  return merged;
+  return Array.from(byRank.values()).sort((left, right) => left.rank - right.rank);
 }
 
 function sanitizeSheetTabName(value: string) {
@@ -2224,6 +2366,7 @@ function mapTask(row: TrendTaskRow): TrendCollectionTask {
     source: row.source === "cache" || row.source === "naver" ? row.source : undefined,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
+    nextAttemptAt: row.next_attempt_at ?? undefined,
     failureReason: row.failure_reason ?? undefined,
     failureSnippet: row.failure_snippet ?? undefined,
     updatedAt: row.updated_at
@@ -2350,6 +2493,10 @@ async function applySchemaChanges(db: D1Database) {
   if (!taskColumns.has("source")) {
     await run(db, "ALTER TABLE trend_tasks ADD COLUMN source TEXT");
   }
+
+  if (!taskColumns.has("next_attempt_at")) {
+    await run(db, "ALTER TABLE trend_tasks ADD COLUMN next_attempt_at TEXT");
+  }
 }
 
 interface TrendProfileRow {
@@ -2415,6 +2562,7 @@ interface TrendTaskRow {
   source?: string | null;
   started_at: string | null;
   completed_at: string | null;
+  next_attempt_at?: string | null;
   failure_reason: string | null;
   failure_snippet: string | null;
   updated_at: string;

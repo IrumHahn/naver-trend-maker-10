@@ -62,6 +62,7 @@ export interface TrendCollectionTask {
   source?: TrendCollectionTaskSource;
   startedAt?: string;
   completedAt?: string;
+  nextAttemptAt?: string;
   failureReason?: string;
   failureSnippet?: string;
   updatedAt: string;

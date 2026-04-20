@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS trend_tasks (
   source TEXT,
   started_at TEXT,
   completed_at TEXT,
+  next_attempt_at TEXT,
   failure_reason TEXT,
   failure_snippet TEXT,
   updated_at TEXT NOT NULL
