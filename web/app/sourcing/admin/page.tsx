@@ -1,30 +1,31 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 import {
   AlertCircle,
   ArrowLeft,
   ArrowRight,
   BarChart3,
-  BookOpen,
   CalendarClock,
   CheckCircle2,
   CircleHelp,
-  Cloud,
   Clock3,
   ExternalLink,
   Flame,
-  PauseCircle,
   LoaderCircle,
-  PlugZap,
+  LogOut,
+  PauseCircle,
   Search,
-  Settings2,
   ShieldAlert,
   Sparkles,
   Target,
   Trash2
 } from "lucide-react";
 import {
+  type AuthLoginInput,
+  type AuthRegisterInput,
+  type AuthSessionState,
+  type AuthTokenSession,
   TREND_MONTHLY_START_PERIOD,
   TREND_RESULT_COUNT_OPTIONS,
   getLatestCollectibleTrendPeriod,
@@ -50,7 +51,8 @@ import { STATIC_TREND_ROOT_CATEGORIES, getStaticTrendCategoryChildren } from "..
 import styles from "./admin.module.css";
 
 const ENV_API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "");
-const API_BASE_STORAGE_KEY = "hanirum:naver-trend-api-base-url";
+const AUTH_TOKEN_STORAGE_KEY = "hanirum:naver-trend-auth-token";
+const LOCAL_DEV_API_BASE_URL = "http://127.0.0.1:8787/v1";
 
 const DEVICE_OPTIONS = [
   ["pc", "PC"],
@@ -127,7 +129,16 @@ type ActionModalState =
     }
   | null;
 
-type SetupPanel = "settings" | "guide" | null;
+type AuthMode = "login" | "register";
+
+type AuthFormState = {
+  name: string;
+  email: string;
+  password: string;
+};
+
+type AuthSessionResponse = ApiError | { ok: true; session: AuthSessionState };
+type AuthTokenSessionResponse = ApiError | { ok: true; session: AuthTokenSession };
 
 const initialForm: TrendFormState = {
   category1: "",
@@ -141,10 +152,20 @@ const initialForm: TrendFormState = {
   customExcludedTerms: ""
 };
 
+const initialAuthForm: AuthFormState = {
+  name: "",
+  email: "",
+  password: ""
+};
+
 export default function SourcingAdminPage() {
   const [apiBaseUrl, setApiBaseUrl] = useState(() => getInitialApiBaseUrl());
-  const [apiBaseUrlDraft, setApiBaseUrlDraft] = useState(() => getInitialApiBaseUrl());
-  const [activeSetupPanel, setActiveSetupPanel] = useState<SetupPanel>(() => (getInitialApiBaseUrl() ? null : "settings"));
+  const [sessionToken, setSessionToken] = useState("");
+  const [authState, setAuthState] = useState<AuthSessionState>({ authenticated: false });
+  const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [authForm, setAuthForm] = useState<AuthFormState>(initialAuthForm);
+  const [authReady, setAuthReady] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [trendBoard, setTrendBoard] = useState<TrendAdminBoard | null>(null);
   const [currentRun, setCurrentRun] = useState<TrendRunDetail | null>(null);
   const [level1Categories, setLevel1Categories] = useState<TrendCategoryNode[]>([]);
@@ -177,11 +198,14 @@ export default function SourcingAdminPage() {
   }, [form.category1, form.category2, form.category3, level1Categories, level2Categories, level3Categories]);
 
   const apiConfigured = Boolean(apiBaseUrl);
-  const apiSourceLabel = apiBaseUrl
-    ? apiBaseUrl === ENV_API_BASE_URL
-      ? "환경변수 연결"
-      : "브라우저 설정 연결"
-    : "연결 필요";
+  const currentUser = authState.authenticated ? authState.user ?? null : null;
+  const authStatusLabel = !apiConfigured
+    ? "API 준비 필요"
+    : !authReady
+      ? "세션 확인 중"
+      : currentUser
+        ? `${currentUser.name} 로그인`
+        : "로그인 필요";
   const visibleRun = currentRun ?? trendBoard?.runs[0] ?? null;
   const completedRuns = (trendBoard?.runs ?? []).filter((run) => run.status === "completed" && run.analysisReady);
   const summaryPeriodLabel = `${TREND_MONTHLY_START_PERIOD} ~ ${latestCollectiblePeriod}`;
@@ -196,16 +220,56 @@ export default function SourcingAdminPage() {
       : "첫 데이터를 기다리는 중입니다.";
 
   useEffect(() => {
-    const storedUrl = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? "");
+    const nextApiBaseUrl =
+      ENV_API_BASE_URL || (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+        ? LOCAL_DEV_API_BASE_URL
+        : "");
 
-    if (!storedUrl) {
-      return;
+    if (nextApiBaseUrl && nextApiBaseUrl !== apiBaseUrl) {
+      setApiBaseUrl(nextApiBaseUrl);
+    }
+  }, [apiBaseUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreSession() {
+      if (!apiBaseUrl) {
+        setAuthState({ authenticated: false });
+        setAuthReady(true);
+        return;
+      }
+
+      const storedToken = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? "";
+      if (!storedToken) {
+        setAuthState({ authenticated: false });
+        setAuthReady(true);
+        return;
+      }
+
+      const response = await api<AuthSessionResponse>(apiBaseUrl, "/auth/session", undefined, storedToken);
+      if (cancelled) {
+        return;
+      }
+
+      if (response.ok && response.session.authenticated) {
+        setSessionToken(storedToken);
+        setAuthState(response.session);
+      } else {
+        window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+        setSessionToken("");
+        setAuthState({ authenticated: false });
+      }
+
+      setAuthReady(true);
     }
 
-    setApiBaseUrl(storedUrl);
-    setApiBaseUrlDraft(storedUrl);
-    setActiveSetupPanel(null);
-  }, []);
+    void restoreSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBaseUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -213,17 +277,21 @@ export default function SourcingAdminPage() {
     async function loadInitial() {
       setLoading(true);
 
-      if (!apiBaseUrl) {
+      if (!apiBaseUrl || !authReady || !authState.authenticated || !sessionToken) {
         setTrendBoard(null);
         setCurrentRun(null);
         setLevel1Categories(STATIC_TREND_ROOT_CATEGORIES);
-        setError(null);
+        if (!apiBaseUrl) {
+          setError("공용 API 주소가 아직 연결되지 않았습니다. 배포 환경변수 NEXT_PUBLIC_API_BASE_URL을 확인해 주세요.");
+        } else if (authReady && !authState.authenticated) {
+          setError(null);
+        }
         setLoading(false);
         return;
       }
 
       const [boardResponse, categories] = await Promise.all([
-        api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board"),
+        api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board", undefined, sessionToken),
         fetchTrendCategories(apiBaseUrl, "0")
       ]);
 
@@ -236,6 +304,11 @@ export default function SourcingAdminPage() {
         setCurrentRun(boardResponse.board.runs[0] ?? null);
       } else {
         setError(boardResponse.message ?? "데이터 취합 상태를 불러오지 못했습니다.");
+        if (boardResponse.code === "HTTP_401") {
+          window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+          setSessionToken("");
+          setAuthState({ authenticated: false });
+        }
       }
 
       setLevel1Categories(categories);
@@ -247,7 +320,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, [apiBaseUrl]);
+  }, [apiBaseUrl, authReady, authState.authenticated, sessionToken]);
 
   useEffect(() => {
     if (!trendBoard?.runs.length) {
@@ -265,16 +338,20 @@ export default function SourcingAdminPage() {
   }, [trendBoard]);
 
   useEffect(() => {
-    if (!apiBaseUrl) {
+    if (!apiBaseUrl || !authState.authenticated || !sessionToken) {
       return;
     }
 
     const interval = window.setInterval(() => {
-      void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
+      void refreshBoard(apiBaseUrl, sessionToken, setTrendBoard, setCurrentRun, setRefreshing, setError, () => {
+        window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+        setSessionToken("");
+        setAuthState({ authenticated: false });
+      });
     }, visibleRun?.status === "running" || visibleRun?.status === "queued" ? 5000 : 12000);
 
     return () => window.clearInterval(interval);
-  }, [apiBaseUrl, visibleRun?.status]);
+  }, [apiBaseUrl, authState.authenticated, sessionToken, visibleRun?.status]);
 
   useEffect(() => {
     if (!form.category1) {
@@ -352,59 +429,93 @@ export default function SourcingAdminPage() {
       };
     });
 
-    if (apiBaseUrl) {
-      void loadSnapshots(apiBaseUrl, visibleRun, latestCompletedPeriod, 1, setSnapshotPanel);
+    if (apiBaseUrl && sessionToken) {
+      void loadSnapshots(apiBaseUrl, sessionToken, visibleRun, latestCompletedPeriod, 1, setSnapshotPanel);
     }
-  }, [apiBaseUrl, visibleRun?.id, visibleRun?.latestCompletedPeriod, visibleRun?.profile.resultCount]);
+  }, [apiBaseUrl, sessionToken, visibleRun?.id, visibleRun?.latestCompletedPeriod, visibleRun?.profile.resultCount]);
 
-  function handleSaveApiBaseUrl() {
-    const normalizedUrl = normalizeApiBaseUrl(apiBaseUrlDraft);
+  async function handleAuthSubmit() {
+    if (!apiBaseUrl) {
+      setError("공용 API 주소가 아직 연결되지 않았습니다. 배포 환경변수 NEXT_PUBLIC_API_BASE_URL을 확인해 주세요.");
+      return;
+    }
 
-    if (!normalizedUrl) {
-      setError("Cloudflare Worker API 주소를 입력해 주세요. 예: https://your-worker.your-subdomain.workers.dev/v1");
+    setAuthSubmitting(true);
+    setError(null);
+    const endpoint = authMode === "login" ? "/auth/login" : "/auth/register";
+    const payload: AuthLoginInput | AuthRegisterInput =
+      authMode === "login"
+        ? {
+            email: authForm.email,
+            password: authForm.password
+          }
+        : {
+            name: authForm.name,
+            email: authForm.email,
+            password: authForm.password
+          };
+
+    const response = await api<AuthTokenSessionResponse>(apiBaseUrl, endpoint, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    setAuthSubmitting(false);
+
+    if (!response.ok) {
+      setError(response.message ?? "로그인에 실패했습니다.");
       setFeedback({
         tone: "error",
-        text: "API 주소가 비어 있어 저장하지 못했습니다."
+        text: response.message ?? "로그인에 실패했습니다."
       });
       return;
     }
 
-    window.localStorage.setItem(API_BASE_STORAGE_KEY, normalizedUrl);
-    setApiBaseUrl(normalizedUrl);
-    setApiBaseUrlDraft(normalizedUrl);
-    setTrendBoard(null);
-    setCurrentRun(null);
-    setSnapshotPanel(null);
-    setError(null);
+    window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, response.session.token);
+    setSessionToken(response.session.token);
+    setAuthState({
+      authenticated: true,
+      user: response.session.user,
+      expiresAt: response.session.expiresAt
+    });
+    setAuthReady(true);
+    setAuthForm(initialAuthForm);
     setFeedback({
       tone: "success",
-      text: "API 주소를 저장했습니다. 이제 이 브라우저는 해당 Cloudflare Worker를 사용합니다."
+      text:
+        authMode === "login"
+          ? "로그인되었습니다. 이제 내 작업 결과만 분리해서 관리할 수 있습니다."
+          : "회원가입과 로그인까지 완료되었습니다. 바로 분석을 시작해 보세요."
     });
   }
 
-  function handleResetApiBaseUrl() {
-    window.localStorage.removeItem(API_BASE_STORAGE_KEY);
-    const nextUrl = ENV_API_BASE_URL;
-    setApiBaseUrl(nextUrl);
-    setApiBaseUrlDraft(nextUrl);
+  function handleAuthFormSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void handleAuthSubmit();
+  }
+
+  async function handleLogout() {
+    if (apiBaseUrl && sessionToken) {
+      await api<{ ok: true } | ApiError>(apiBaseUrl, "/auth/logout", { method: "POST" }, sessionToken);
+    }
+
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    setSessionToken("");
+    setAuthState({ authenticated: false });
     setTrendBoard(null);
     setCurrentRun(null);
     setSnapshotPanel(null);
     setFeedback({
       tone: "info",
-      text: nextUrl
-        ? "브라우저 설정을 지우고 배포 환경변수의 API 주소로 되돌렸습니다."
-        : "API 주소 설정을 지웠습니다. 새 Worker 주소를 입력하면 분석을 시작할 수 있습니다."
+      text: "로그아웃되었습니다."
     });
   }
 
   async function handleStartAnalysis() {
-    if (!apiBaseUrl) {
-      setActiveSetupPanel("settings");
-      setError("먼저 Cloudflare Worker API 주소를 설정해 주세요.");
+    if (!apiBaseUrl || !sessionToken) {
+      setError("먼저 로그인한 뒤 분석을 시작해 주세요.");
       setFeedback({
         tone: "error",
-        text: "공용 API 기본 연결은 제거되었습니다. 본인 Cloudflare Worker 주소를 저장한 뒤 분석을 시작해 주세요."
+        text: "공용 서비스에서는 로그인 후에만 개인 작업 공간이 열립니다."
       });
       return;
     }
@@ -421,23 +532,28 @@ export default function SourcingAdminPage() {
       text: "조건을 저장하고 바로 데이터 취합을 시작하고 있습니다."
     });
 
-    const response = await api<TrendCollectResponse>(apiBaseUrl, "/trends/collect", {
-      method: "POST",
-      body: JSON.stringify({
-        name: buildAnalysisRequestName(selectedCategory.fullPath, form),
-        categoryCid: selectedCategory.cid,
-        categoryPath: selectedCategory.fullPath,
-        categoryDepth: selectedCategory.level,
-        timeUnit: "month",
-        devices: form.devices,
-        genders: form.genders,
-        ages: form.ages,
-        spreadsheetId: "",
-        resultCount: form.resultCount,
-        excludeBrandProducts: form.excludeBrandProducts,
-        customExcludedTerms: splitExcludedTerms(form.customExcludedTerms)
-      })
-    });
+    const response = await api<TrendCollectResponse>(
+      apiBaseUrl,
+      "/trends/collect",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name: buildAnalysisRequestName(selectedCategory.fullPath, form),
+          categoryCid: selectedCategory.cid,
+          categoryPath: selectedCategory.fullPath,
+          categoryDepth: selectedCategory.level,
+          timeUnit: "month",
+          devices: form.devices,
+          genders: form.genders,
+          ages: form.ages,
+          spreadsheetId: "",
+          resultCount: form.resultCount,
+          excludeBrandProducts: form.excludeBrandProducts,
+          customExcludedTerms: splitExcludedTerms(form.customExcludedTerms)
+        })
+      },
+      sessionToken
+    );
 
     setSubmitting(false);
 
@@ -472,7 +588,11 @@ export default function SourcingAdminPage() {
         : "데이터 취합을 시작했습니다. 오른쪽 패널에서 진행 상황과 분석 결과를 확인해 주세요."
     });
 
-    void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
+    void refreshBoard(apiBaseUrl, sessionToken, setTrendBoard, setCurrentRun, setRefreshing, setError, () => {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      setSessionToken("");
+      setAuthState({ authenticated: false });
+    });
   }
 
   async function handleConfirmAction() {
@@ -480,9 +600,8 @@ export default function SourcingAdminPage() {
       return;
     }
 
-    if (!apiBaseUrl) {
-      setActiveSetupPanel("settings");
-      setError("런을 제어하려면 Cloudflare Worker API 주소가 필요합니다.");
+    if (!apiBaseUrl || !sessionToken) {
+      setError("런을 제어하려면 먼저 로그인해 주세요.");
       return;
     }
 
@@ -494,7 +613,8 @@ export default function SourcingAdminPage() {
       actionModal.type === "cancel" ? `/trends/runs/${actionModal.run.id}/cancel` : `/trends/runs/${actionModal.run.id}`,
       {
         method: actionModal.type === "cancel" ? "POST" : "DELETE"
-      }
+      },
+      sessionToken
     );
 
     setActionSubmitting(false);
@@ -536,14 +656,17 @@ export default function SourcingAdminPage() {
 
     setActionModal(null);
     if (apiBaseUrl) {
-      void refreshBoard(apiBaseUrl, setTrendBoard, setCurrentRun, setRefreshing, setError);
+      void refreshBoard(apiBaseUrl, sessionToken, setTrendBoard, setCurrentRun, setRefreshing, setError, () => {
+        window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+        setSessionToken("");
+        setAuthState({ authenticated: false });
+      });
     }
   }
 
   async function handleSelectArchivedRun(run: TrendRunDetail) {
-    if (!apiBaseUrl) {
-      setActiveSetupPanel("settings");
-      setError("완료 작업을 불러오려면 Cloudflare Worker API 주소가 필요합니다.");
+    if (!apiBaseUrl || !sessionToken) {
+      setError("완료 작업을 불러오려면 먼저 로그인해 주세요.");
       return;
     }
 
@@ -553,7 +676,7 @@ export default function SourcingAdminPage() {
       text: "완료된 기존 작업 결과를 불러오고 있습니다."
     });
 
-    const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${run.id}`);
+    const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${run.id}`, undefined, sessionToken);
 
     if (!response.ok) {
       setError(response.message ?? "완료된 기존 작업 결과를 불러오지 못했습니다.");
@@ -638,7 +761,7 @@ export default function SourcingAdminPage() {
   useEffect(() => {
     const run = visibleRun;
 
-    if (!apiBaseUrl || !run?.analysisReady || run.analysisSummary || detailLoadingRunId === run.id) {
+    if (!apiBaseUrl || !sessionToken || !run?.analysisReady || run.analysisSummary || detailLoadingRunId === run.id) {
       return;
     }
     const targetRun = run;
@@ -647,7 +770,7 @@ export default function SourcingAdminPage() {
 
     async function loadRunDetail() {
       setDetailLoadingRunId(targetRun.id);
-      const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${targetRun.id}`);
+      const response = await api<TrendRunResponse>(apiBaseUrl, `/trends/runs/${targetRun.id}`, undefined, sessionToken);
 
       if (cancelled) {
         return;
@@ -677,7 +800,7 @@ export default function SourcingAdminPage() {
     return () => {
       cancelled = true;
     };
-  }, [apiBaseUrl, detailLoadingRunId, visibleRun]);
+  }, [apiBaseUrl, detailLoadingRunId, sessionToken, visibleRun]);
 
   return (
     <main className={styles.page}>
@@ -697,7 +820,7 @@ export default function SourcingAdminPage() {
             <span className={styles.summaryPill}>기본 수집 20개 · 확장 40개</span>
             <span className={styles.summaryPill}>브랜드 제품 제외 옵션 제공</span>
             <span className={apiConfigured ? `${styles.summaryPill} ${styles.connectedPill}` : `${styles.summaryPill} ${styles.warningPill}`}>
-              API {apiSourceLabel}
+              계정 {authStatusLabel}
             </span>
           </div>
         </header>
@@ -705,102 +828,128 @@ export default function SourcingAdminPage() {
         <section className={`${styles.surface} ${styles.setupSurface}`}>
           <div className={styles.setupHeader}>
             <div>
-              <p className={styles.surfaceEyebrow}>SETUP</p>
-              <h2 className={styles.setupTitle}>Cloudflare Worker 연결</h2>
+              <p className={styles.surfaceEyebrow}>ACCOUNT</p>
+              <h2 className={styles.setupTitle}>{currentUser ? "공용 서비스 연결 완료" : "로그인 후 내 작업 공간 열기"}</h2>
               <p className={styles.surfaceDescription}>
-                이 저장소는 각 사용자가 본인 Cloudflare Worker와 D1을 연결해 독립적으로 작업 결과를 관리하도록 설계되었습니다.
+                공용 웹과 공용 API를 사용하되, 로그인된 사용자 기준으로 작업 결과와 수집 런을 분리해서 관리합니다.
               </p>
             </div>
-            <div className={styles.setupTabs} role="tablist" aria-label="Cloudflare 설정 메뉴">
-              <button
-                type="button"
-                className={activeSetupPanel === "settings" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
-                onClick={() => setActiveSetupPanel(activeSetupPanel === "settings" ? null : "settings")}
-              >
-                <Settings2 size={15} />
-                API 설정
-              </button>
-              <button
-                type="button"
-                className={activeSetupPanel === "guide" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
-                onClick={() => setActiveSetupPanel(activeSetupPanel === "guide" ? null : "guide")}
-              >
-                <BookOpen size={15} />
-                가이드
-              </button>
+            <div className={styles.setupTabs} role="tablist" aria-label="계정 작업">
+              {currentUser ? (
+                <button type="button" className={`${styles.setupTab} ${styles.setupTabActive}`}>
+                  {currentUser.name}
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className={authMode === "login" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
+                    onClick={() => setAuthMode("login")}
+                  >
+                    로그인
+                  </button>
+                  <button
+                    type="button"
+                    className={authMode === "register" ? `${styles.setupTab} ${styles.setupTabActive}` : styles.setupTab}
+                    onClick={() => setAuthMode("register")}
+                  >
+                    회원가입
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
-          {activeSetupPanel === "settings" ? (
+          {!apiConfigured ? (
             <div className={styles.setupPanel}>
               <div className={styles.connectionCard}>
-                <span className={apiConfigured ? `${styles.connectionDot} ${styles.connectionDotReady}` : styles.connectionDot} />
+                <span className={styles.connectionDot} />
                 <div>
-                  <strong>{apiConfigured ? "개인 Worker API가 연결되어 있습니다." : "Worker API 주소 설정이 필요합니다."}</strong>
+                  <strong>공용 API 환경설정이 아직 없습니다.</strong>
                   <p>
-                    {apiConfigured
-                      ? `현재 사용 중: ${apiBaseUrl}`
-                      : "Cloudflare Worker를 배포한 뒤 /v1이 붙은 API 주소를 입력해 주세요."}
+                    배포 환경변수 `NEXT_PUBLIC_API_BASE_URL`이 설정되어야 이 화면이 공용 API와 연결됩니다.
                   </p>
                 </div>
               </div>
-
-              <label className={styles.field}>
-                <span className={styles.fieldLabel}>NEXT_PUBLIC_API_BASE_URL</span>
-                <input
-                  className={styles.fieldInput}
-                  type="url"
-                  value={apiBaseUrlDraft}
-                  onChange={(event) => setApiBaseUrlDraft(event.target.value)}
-                  placeholder="https://your-worker.your-subdomain.workers.dev/v1"
-                  spellCheck={false}
-                />
-              </label>
+            </div>
+          ) : !authReady ? (
+            <div className={styles.setupPanel}>
+              <div className={styles.connectionCard}>
+                <span className={`${styles.connectionDot} ${styles.connectionDotReady}`} />
+                <div>
+                  <strong>기존 로그인 상태를 확인하고 있습니다.</strong>
+                  <p>저장된 세션이 있으면 자동으로 복원하고, 없으면 바로 로그인 화면으로 전환합니다.</p>
+                </div>
+              </div>
+            </div>
+          ) : currentUser ? (
+            <div className={styles.setupPanel}>
+              <div className={styles.connectionCard}>
+                <span className={`${styles.connectionDot} ${styles.connectionDotReady}`} />
+                <div>
+                  <strong>{currentUser.name}님의 작업 공간이 연결되어 있습니다.</strong>
+                  <p>{currentUser.email} 계정으로 로그인되어 있으며, 취합 런과 결과 리포트는 이 계정 기준으로만 표시됩니다.</p>
+                </div>
+              </div>
 
               <div className={styles.setupActions}>
-                <button className={styles.secondaryButton} type="button" onClick={handleSaveApiBaseUrl}>
-                  <PlugZap size={15} />
-                  API 주소 저장
-                </button>
-                <button className={styles.ghostButton} type="button" onClick={handleResetApiBaseUrl}>
-                  설정 초기화
+                <button className={styles.ghostButton} type="button" onClick={() => void handleLogout()}>
+                  <LogOut size={15} />
+                  로그아웃
                 </button>
               </div>
             </div>
-          ) : null}
+          ) : (
+            <div className={styles.setupPanel}>
+              <form onSubmit={handleAuthFormSubmit}>
+                <div className={styles.formGrid}>
+                  {authMode === "register" ? (
+                    <label className={styles.field}>
+                      <span className={styles.fieldLabel}>이름</span>
+                      <input
+                        className={styles.fieldInput}
+                        type="text"
+                        value={authForm.name}
+                        onChange={(event) => setAuthForm((current) => ({ ...current, name: event.target.value }))}
+                        placeholder="예: 한이룸"
+                      />
+                    </label>
+                  ) : null}
 
-          {activeSetupPanel === "guide" ? (
-            <div className={styles.guidePanel}>
-              <GuideStep
-                number="1"
-                title="Cloudflare 가입 및 Wrangler 로그인"
-                body="Cloudflare 계정을 만든 뒤 터미널에서 Wrangler에 로그인합니다."
-                command={"pnpm install\npnpm wrangler login"}
-                link="https://developers.cloudflare.com/workers/wrangler/"
-              />
-              <GuideStep
-                number="2"
-                title="D1 데이터베이스 만들기"
-                body="트렌드 수집 결과와 분석 작업을 저장할 개인 D1 DB를 만듭니다. 생성 후 표시되는 database_id를 edge-api/wrangler.jsonc에 넣어 주세요."
-                command="pnpm wrangler d1 create naver-trend-maker-db"
-                link="https://developers.cloudflare.com/d1/get-started/"
-              />
-              <GuideStep
-                number="3"
-                title="스키마 적용 후 Worker 배포"
-                body="DB 테이블을 만든 뒤 Worker를 배포합니다. 배포가 끝나면 workers.dev 주소를 확인할 수 있습니다."
-                command={"pnpm wrangler d1 execute naver-trend-maker-db --remote --file edge-api/schema.sql\npnpm wrangler deploy --config edge-api/wrangler.jsonc"}
-                link="https://developers.cloudflare.com/d1/wrangler-commands/"
-              />
-              <GuideStep
-                number="4"
-                title="프론트에 API 주소 저장"
-                body="배포된 Worker 주소 뒤에 /v1을 붙여 이 화면의 API 설정에 저장합니다. 예: https://naver-trend-maker-api.your-subdomain.workers.dev/v1"
-                command="NEXT_PUBLIC_API_BASE_URL=https://your-worker.your-subdomain.workers.dev/v1"
-                link="https://developers.cloudflare.com/workers/wrangler/configuration/"
-              />
+                  <label className={styles.field}>
+                    <span className={styles.fieldLabel}>이메일</span>
+                    <input
+                      className={styles.fieldInput}
+                      type="email"
+                      value={authForm.email}
+                      onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))}
+                      placeholder="you@example.com"
+                      autoComplete="email"
+                    />
+                  </label>
+
+                  <label className={styles.field}>
+                    <span className={styles.fieldLabel}>비밀번호</span>
+                    <input
+                      className={styles.fieldInput}
+                      type="password"
+                      value={authForm.password}
+                      onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))}
+                      placeholder="8자 이상 입력"
+                      autoComplete={authMode === "login" ? "current-password" : "new-password"}
+                    />
+                  </label>
+                </div>
+
+                <div className={styles.setupActions}>
+                  <button className={styles.secondaryButton} type="submit" disabled={authSubmitting}>
+                    {authSubmitting ? <LoaderCircle className={styles.spinningIcon} size={15} /> : <Sparkles size={15} />}
+                    {authMode === "login" ? "로그인" : "회원가입 후 시작"}
+                  </button>
+                </div>
+              </form>
             </div>
-          ) : null}
+          )}
         </section>
 
         {error ? (
@@ -810,7 +959,7 @@ export default function SourcingAdminPage() {
           </div>
         ) : null}
 
-        <div className={styles.workspace}>
+        {currentUser ? <div className={styles.workspace}>
           <section className={`${styles.surface} ${styles.formSurface}`}>
             <div className={styles.surfaceHeader}>
               <p className={styles.surfaceEyebrow}>INPUT</p>
@@ -1004,8 +1153,8 @@ export default function SourcingAdminPage() {
                   </>
                 ) : !apiConfigured ? (
                   <>
-                    <Cloud size={16} />
-                    API 설정 필요
+                    <AlertCircle size={16} />
+                    서비스 연결 필요
                   </>
                 ) : (
                   <>
@@ -1349,7 +1498,11 @@ export default function SourcingAdminPage() {
                               <select
                                 className={styles.fieldInput}
                                 value={snapshotPanel?.period ?? visibleRun.latestCompletedPeriod}
-                                onChange={(event) => void loadSnapshots(apiBaseUrl, visibleRun, event.target.value, 1, setSnapshotPanel)}
+                                onChange={(event) =>
+                                  sessionToken
+                                    ? void loadSnapshots(apiBaseUrl, sessionToken, visibleRun, event.target.value, 1, setSnapshotPanel)
+                                    : undefined
+                                }
                               >
                                 {[...new Set(visibleRun.tasks.filter((task) => task.status === "completed").map((task) => task.period))]
                                   .sort((left, right) => right.localeCompare(left))
@@ -1367,7 +1520,16 @@ export default function SourcingAdminPage() {
                                 type="button"
                                 onClick={() =>
                                   visibleRun && snapshotPanel && apiBaseUrl
-                                    ? void loadSnapshots(apiBaseUrl, visibleRun, snapshotPanel.period, snapshotPanel.page - 1, setSnapshotPanel)
+                                    ? sessionToken
+                                      ? void loadSnapshots(
+                                          apiBaseUrl,
+                                          sessionToken,
+                                          visibleRun,
+                                          snapshotPanel.period,
+                                          snapshotPanel.page - 1,
+                                          setSnapshotPanel
+                                        )
+                                      : undefined
                                     : undefined
                                 }
                                 disabled={!snapshotPanel || snapshotPanel.page <= 1 || snapshotPanel.loading}
@@ -1380,7 +1542,16 @@ export default function SourcingAdminPage() {
                                 type="button"
                                 onClick={() =>
                                   visibleRun && snapshotPanel && apiBaseUrl
-                                    ? void loadSnapshots(apiBaseUrl, visibleRun, snapshotPanel.period, snapshotPanel.page + 1, setSnapshotPanel)
+                                    ? sessionToken
+                                      ? void loadSnapshots(
+                                          apiBaseUrl,
+                                          sessionToken,
+                                          visibleRun,
+                                          snapshotPanel.period,
+                                          snapshotPanel.page + 1,
+                                          setSnapshotPanel
+                                        )
+                                      : undefined
                                     : undefined
                                 }
                                 disabled={!snapshotPanel || snapshotPanel.page >= snapshotPanel.totalPages || snapshotPanel.loading}
@@ -1442,7 +1613,7 @@ export default function SourcingAdminPage() {
               )}
             </div>
           </section>
-        </div>
+        </div> : null}
 
         {actionModal ? (
           <div className={styles.modalOverlay} role="presentation">
@@ -1541,37 +1712,6 @@ function ProgressStat({ label, value, hint }: { label: string; value: string; hi
       <strong className={styles.progressStatValue}>{value}</strong>
       <span className={styles.progressStatHint}>{hint}</span>
     </div>
-  );
-}
-
-function GuideStep({
-  number,
-  title,
-  body,
-  command,
-  link
-}: {
-  number: string;
-  title: string;
-  body: string;
-  command: string;
-  link: string;
-}) {
-  return (
-    <article className={styles.guideStep}>
-      <div className={styles.guideStepBadge}>{number}</div>
-      <div className={styles.guideStepBody}>
-        <div className={styles.guideStepHeader}>
-          <h3>{title}</h3>
-          <a href={link} target="_blank" rel="noreferrer" aria-label={`${title} 공식 문서 열기`}>
-            공식 문서
-            <ExternalLink size={13} />
-          </a>
-        </div>
-        <p>{body}</p>
-        <pre className={styles.commandBlock}>{command}</pre>
-      </div>
-    </article>
   );
 }
 
@@ -2125,20 +2265,25 @@ function Sparkline({ points }: { points: TrendAnalysisSeriesPoint[] }) {
 
 async function refreshBoard(
   apiBaseUrl: string,
+  sessionToken: string,
   setTrendBoard: (value: TrendAdminBoard | null) => void,
   setCurrentRun: Dispatch<SetStateAction<TrendRunDetail | null>>,
   setRefreshing: (value: boolean) => void,
-  setError: (value: string | null) => void
+  setError: (value: string | null) => void,
+  onUnauthorized: () => void
 ) {
-  if (!apiBaseUrl) {
+  if (!apiBaseUrl || !sessionToken) {
     return;
   }
 
   setRefreshing(true);
-  const response = await api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board");
+  const response = await api<TrendBoardResponse>(apiBaseUrl, "/trends/admin/board", undefined, sessionToken);
   setRefreshing(false);
 
   if (!response.ok) {
+    if (response.code === "HTTP_401") {
+      onUnauthorized();
+    }
     setError(response.message ?? "데이터 취합 상태를 새로고침하지 못했습니다.");
     return;
   }
@@ -2175,6 +2320,7 @@ async function fetchTrendCategories(apiBaseUrl: string, cid: string) {
 
 async function loadSnapshots(
   apiBaseUrl: string,
+  sessionToken: string,
   run: TrendRunDetail,
   period: string,
   page: number,
@@ -2192,7 +2338,9 @@ async function loadSnapshots(
 
   const response = await api<TrendSnapshotPageResponse>(
     apiBaseUrl,
-    `/trends/runs/${run.id}/snapshots?period=${encodeURIComponent(period)}&page=${page}`
+    `/trends/runs/${run.id}/snapshots?period=${encodeURIComponent(period)}&page=${page}`,
+    undefined,
+    sessionToken
   );
 
   if (!response.ok) {
@@ -2611,12 +2759,13 @@ function normalizeApiBaseUrl(value: string) {
   return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
-async function api<T>(apiBaseUrl: string, path: string, init?: RequestInit): Promise<T> {
+async function api<T>(apiBaseUrl: string, path: string, init?: RequestInit, authToken?: string): Promise<T> {
   try {
     const response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
       headers: {
         "Content-Type": "application/json",
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         ...(init?.headers ?? {})
       }
     });

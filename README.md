@@ -10,9 +10,14 @@
 - `edge-api`: Cloudflare Worker 기반 수집/분석 API
 - `shared`: 웹과 Worker가 함께 쓰는 타입/상수
 
-## 왜 개인 Worker가 필요한가요?
+## 현재 서비스 구조
 
-공용 Worker를 모두가 같이 쓰면 다른 사용자의 작업 결과가 `작업 결과 보기`에 섞일 수 있습니다. 이 저장소는 각 사용자가 자기 Cloudflare Worker와 D1을 배포한 뒤, 화면의 `API 설정`에 본인 API 주소를 저장해서 쓰는 구조를 권장합니다.
+- 공용 웹 1개
+- 공용 Cloudflare Worker API 1개
+- 공용 D1 데이터베이스 1개
+- 사용자 로그인 후 `owner_user_id` 기준으로 데이터 분리
+
+즉, 이제는 `각 사용자가 자기 Worker를 따로 연결하는 구조`가 아니라 `하나의 공용 서비스`로 배포하는 전제를 기준으로 동작합니다.
 
 ## 로컬 실행
 
@@ -22,13 +27,18 @@ pnpm --filter @runacademy/shared build
 pnpm --filter @runacademy/web dev
 ```
 
+선택 사항:
+
+- 로컬에서 Worker까지 같이 확인하려면 `npx wrangler dev --config edge-api/wrangler.jsonc`를 함께 실행합니다.
+- 프론트는 개발 환경에서 `NEXT_PUBLIC_API_BASE_URL`이 없으면 기본적으로 `http://127.0.0.1:8787/v1`을 바라봅니다.
+
 관리자 화면:
 
 ```text
 http://localhost:3000/sourcing/admin
 ```
 
-## Cloudflare Worker / D1 셋업
+## 공용 API / D1 셋업
 
 ### 1. Cloudflare 로그인
 
@@ -57,22 +67,28 @@ pnpm wrangler d1 execute naver-trend-maker-db --remote --file edge-api/schema.sq
 pnpm wrangler deploy --config edge-api/wrangler.jsonc
 ```
 
-배포 후 표시되는 Worker URL 뒤에 `/v1`을 붙여 API 주소로 사용합니다.
+배포 후 표시되는 Worker URL 뒤에 `/v1`을 붙여 공용 API 주소로 사용합니다.
 
 ```text
-https://your-worker.your-subdomain.workers.dev/v1
+https://your-shared-api.your-subdomain.workers.dev/v1
 ```
 
-### 5. 프론트에서 API 주소 연결
+### 5. 웹 배포 환경변수 설정
 
-두 방법 중 하나를 사용합니다.
-
-- 화면 상단 `API 설정`에 Worker API 주소를 저장합니다.
-- 또는 배포 환경변수에 `NEXT_PUBLIC_API_BASE_URL`을 설정합니다.
+웹 배포 환경변수에 공용 API 주소를 설정합니다.
 
 ```env
-NEXT_PUBLIC_API_BASE_URL=https://your-worker.your-subdomain.workers.dev/v1
+NEXT_PUBLIC_API_BASE_URL=https://your-shared-api.your-subdomain.workers.dev/v1
 ```
+
+### 6. 로그인 기반 사용자 분리
+
+- `POST /v1/auth/register`
+- `POST /v1/auth/login`
+- `GET /v1/auth/session`
+- `POST /v1/auth/logout`
+
+트렌드 프로필, 수집 런, 스냅샷 조회는 로그인된 사용자 토큰 기준으로만 접근됩니다. 월별 원본 캐시는 같은 조건이면 재사용될 수 있지만, 화면에 보이는 작업 히스토리와 런 상세는 사용자별로 분리됩니다.
 
 ## 참고 문서
 

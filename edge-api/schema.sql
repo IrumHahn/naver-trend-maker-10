@@ -1,6 +1,29 @@
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  email_normalized TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  revoked_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS trend_profiles (
   id TEXT PRIMARY KEY,
   slug TEXT NOT NULL UNIQUE,
+  owner_user_id TEXT NOT NULL,
   name TEXT NOT NULL,
   status TEXT NOT NULL,
   start_period TEXT NOT NULL,
@@ -94,3 +117,6 @@ CREATE INDEX IF NOT EXISTS idx_trend_tasks_status ON trend_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_trend_tasks_period ON trend_tasks(period);
 CREATE INDEX IF NOT EXISTS idx_trend_snapshots_profile_period ON trend_snapshots(profile_id, period);
 CREATE INDEX IF NOT EXISTS idx_trend_snapshots_run_id ON trend_snapshots(run_id);
+CREATE INDEX IF NOT EXISTS idx_trend_profiles_owner_user_id ON trend_profiles(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_token_hash ON auth_sessions(token_hash);

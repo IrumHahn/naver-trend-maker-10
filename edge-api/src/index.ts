@@ -12,6 +12,11 @@ import {
   normalizeTrendResultCount,
   normalizeTrendSpreadsheetId,
   serializeTrendFilter,
+  type AuthLoginInput,
+  type AuthRegisterInput,
+  type AuthSessionState,
+  type AuthTokenSession,
+  type AuthUser,
   type TrendAdminBoard,
   type TrendAgeCode,
   type TrendCollectionRun,
@@ -70,12 +75,11 @@ const NAVER_BASE_URL = "https://datalab.naver.com";
 const NAVER_CATEGORY_PAGE_URL = `${NAVER_BASE_URL}/shoppingInsight/sCategory.naver`;
 const NAVER_BROWSER_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
-const DEFAULT_OPERATOR_ID = "haniroom-trend-operator";
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-  "access-control-allow-headers": "content-type"
+  "access-control-allow-headers": "content-type, authorization"
 };
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const PROCESS_BATCH_MAX_TASKS = 8;
@@ -83,6 +87,10 @@ const PROCESS_BATCH_MAX_WALL_MS = 25_000;
 const NAVER_INTER_MONTH_DELAY_MS = 650;
 const NAVER_INTER_MONTH_DELAY_JITTER_MS = 450;
 const TASK_AUTO_RETRY_LIMIT = 4;
+const AUTH_PASSWORD_ITERATIONS = 160_000;
+const AUTH_SESSION_TTL_DAYS = 30;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const textEncoder = new TextEncoder();
 let schemaReadyPromise: Promise<void> | null = null;
 
 type NaverSessionRef = {
@@ -105,13 +113,36 @@ export default {
         return respondJson({ ok: true, service: env.APP_NAME ?? "hanirum-sourcing-trend-api" });
       }
 
+      if (request.method === "POST" && pathname === "/v1/auth/register") {
+        const body = (await request.json()) as AuthRegisterInput;
+        return respondJson(await registerUser(env.DB, body));
+      }
+
+      if (request.method === "POST" && pathname === "/v1/auth/login") {
+        const body = (await request.json()) as AuthLoginInput;
+        return respondJson(await loginUser(env.DB, body));
+      }
+
+      if (request.method === "POST" && pathname === "/v1/auth/logout") {
+        return respondJson(await logoutUser(env.DB, request));
+      }
+
+      if (request.method === "GET" && pathname === "/v1/auth/session") {
+        return respondJson(await getSessionState(env.DB, request));
+      }
+
       if (request.method === "GET" && pathname === "/v1/sourcing/admin/review-board") {
         return respondJson(buildEmptySourcingBoard());
       }
 
       if (request.method === "GET" && pathname === "/v1/trends/admin/board") {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         await recoverRetryableFailedTasks(env.DB);
-        const board = await getTrendAdminBoard(env.DB);
+        const board = await getTrendAdminBoard(env.DB, authenticated.user.id);
 
         if (await shouldKickQueuedProcessing(env.DB)) {
           ctx.waitUntil(processQueuedRunBatch(env));
@@ -121,17 +152,32 @@ export default {
       }
 
       if (request.method === "GET" && pathname === "/v1/trends/profiles") {
-        return respondJson({ ok: true, profiles: await listTrendProfiles(env.DB) });
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson({ ok: true, profiles: await listTrendProfiles(env.DB, authenticated.user.id) });
       }
 
       if (request.method === "POST" && pathname === "/v1/trends/profiles") {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         const body = (await request.json()) as TrendProfileInput;
-        return respondJson(await createTrendProfile(env.DB, body));
+        return respondJson(await createTrendProfile(env.DB, authenticated.user.id, body));
       }
 
       if (request.method === "POST" && pathname === "/v1/trends/collect") {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         const body = (await request.json()) as TrendProfileInput;
-        const response = await startTrendCollection(env.DB, body);
+        const response = await startTrendCollection(env.DB, authenticated.user, body);
 
         if (response.ok && (response.run.status === "queued" || response.run.status === "running")) {
           ctx.waitUntil(processQueuedRunBatch(env, { runId: response.run.id }));
@@ -149,8 +195,13 @@ export default {
 
       const runMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)$/);
       if (request.method === "GET" && runMatch) {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         await recoverRetryableFailedTasks(env.DB, runMatch[1]);
-        const response = await getTrendRun(env.DB, runMatch[1]);
+        const response = await getTrendRun(env.DB, authenticated.user.id, runMatch[1]);
 
         if (response.ok && (await shouldKickQueuedProcessing(env.DB, runMatch[1]))) {
           ctx.waitUntil(processQueuedRunBatch(env, { runId: runMatch[1] }));
@@ -161,37 +212,72 @@ export default {
 
       const cancelMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)\/cancel$/);
       if (request.method === "POST" && cancelMatch) {
-        return respondJson(await cancelTrendRun(env.DB, cancelMatch[1]));
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson(await cancelTrendRun(env.DB, authenticated.user.id, cancelMatch[1]));
       }
 
       const deleteMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)$/);
       if (request.method === "DELETE" && deleteMatch) {
-        return respondJson(await deleteTrendRun(env.DB, deleteMatch[1]));
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson(await deleteTrendRun(env.DB, authenticated.user.id, deleteMatch[1]));
       }
 
       const runSnapshotsMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)\/snapshots$/);
       if (request.method === "GET" && runSnapshotsMatch) {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         const period = url.searchParams.get("period")?.trim() ?? "";
         const page = Math.max(1, Number(url.searchParams.get("page") ?? "1") || 1);
-        return respondJson(await getTrendRunSnapshotsPage(env.DB, runSnapshotsMatch[1], period, page));
+        return respondJson(await getTrendRunSnapshotsPage(env.DB, authenticated.user.id, runSnapshotsMatch[1], period, page));
       }
 
       const retryMatch = pathname.match(/^\/v1\/trends\/runs\/([^/]+)\/retry-failures$/);
       if (request.method === "POST" && retryMatch) {
-        return respondJson(await retryFailedTasks(env.DB, retryMatch[1]));
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson(await retryFailedTasks(env.DB, authenticated.user.id, retryMatch[1]));
       }
 
       const backfillMatch = pathname.match(/^\/v1\/trends\/profiles\/([^/]+)\/backfill$/);
       if (request.method === "POST" && backfillMatch) {
-        return respondJson(await startBackfill(env.DB, backfillMatch[1]));
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson(await startBackfill(env.DB, authenticated.user, backfillMatch[1]));
       }
 
       const syncMatch = pathname.match(/^\/v1\/trends\/profiles\/([^/]+)\/sync-sheet$/);
       if (request.method === "POST" && syncMatch) {
-        return respondJson(await syncProfileToSheets(env, syncMatch[1]));
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
+        return respondJson(await syncProfileToSheets(env, authenticated.user.id, syncMatch[1]));
       }
 
       if (request.method === "POST" && pathname === "/v1/trends/worker/process-next") {
+        const authenticated = await requireAuthenticatedUser(request, env.DB);
+        if (!authenticated.ok) {
+          return respondJson(authenticated.error, 401);
+        }
+
         await recoverRetryableFailedTasks(env.DB);
         return respondJson(await processQueuedRunBatch(env));
       }
@@ -246,13 +332,252 @@ function buildEmptySourcingBoard() {
   };
 }
 
-async function getTrendAdminBoard(db: D1Database): Promise<TrendAdminBoard> {
-  const profiles = await listTrendProfiles(db);
+async function requireAuthenticatedUser(request: Request, db: D1Database) {
+  const session = await authenticateRequest(request, db);
+
+  if (!session) {
+    return {
+      ok: false as const,
+      error: {
+        ok: false as const,
+        code: "AUTH_REQUIRED",
+        message: "먼저 로그인한 뒤 계속 진행해 주세요."
+      }
+    };
+  }
+
+  return {
+    ok: true as const,
+    user: session.user,
+    session
+  };
+}
+
+async function getSessionState(db: D1Database, request: Request) {
+  const session = await authenticateRequest(request, db);
+
+  if (!session) {
+    return {
+      ok: true as const,
+      session: {
+        authenticated: false
+      } satisfies AuthSessionState
+    };
+  }
+
+  return {
+    ok: true as const,
+    session: {
+      authenticated: true,
+      user: session.user,
+      expiresAt: session.expiresAt
+    } satisfies AuthSessionState
+  };
+}
+
+async function registerUser(db: D1Database, input: AuthRegisterInput) {
+  const email = normalizeEmail(input.email);
+  const password = input.password ?? "";
+  const name = normalizeDisplayName(input.name, email);
+
+  if (!EMAIL_PATTERN.test(email)) {
+    return {
+      ok: false as const,
+      code: "INVALID_EMAIL",
+      message: "올바른 이메일 주소를 입력해 주세요."
+    };
+  }
+
+  if (password.length < 8) {
+    return {
+      ok: false as const,
+      code: "PASSWORD_TOO_SHORT",
+      message: "비밀번호는 8자 이상으로 입력해 주세요."
+    };
+  }
+
+  const existing = await one<AuthUserRow>(db, "SELECT * FROM users WHERE email_normalized = ?", [email]);
+  if (existing) {
+    return {
+      ok: false as const,
+      code: "EMAIL_ALREADY_IN_USE",
+      message: "이미 가입된 이메일입니다. 로그인으로 계속 진행해 주세요."
+    };
+  }
+
+  const now = nowIso();
+  const passwordSalt = randomToken(16);
+  const passwordHash = await hashPassword(password, passwordSalt);
+  const user: AuthUser = {
+    id: crypto.randomUUID(),
+    email,
+    name,
+    createdAt: now,
+    updatedAt: now
+  };
+
+  await run(
+    db,
+    `INSERT INTO users (
+      id, email, email_normalized, name, password_hash, password_salt, created_at, updated_at, last_login_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user.id, user.email, email, user.name, passwordHash, passwordSalt, user.createdAt, user.updatedAt, now]
+  );
+
+  await claimLegacyProfilesForFirstUser(db, user.id);
+  const authSession = await createAuthSession(db, user);
+
+  return {
+    ok: true as const,
+    session: authSession
+  };
+}
+
+async function loginUser(db: D1Database, input: AuthLoginInput) {
+  const email = normalizeEmail(input.email);
+  const password = input.password ?? "";
+  const row = await one<AuthUserRow>(db, "SELECT * FROM users WHERE email_normalized = ?", [email]);
+
+  if (!row) {
+    return {
+      ok: false as const,
+      code: "INVALID_CREDENTIALS",
+      message: "이메일 또는 비밀번호가 맞지 않습니다."
+    };
+  }
+
+  const passwordHash = await hashPassword(password, row.password_salt);
+  if (passwordHash !== row.password_hash) {
+    return {
+      ok: false as const,
+      code: "INVALID_CREDENTIALS",
+      message: "이메일 또는 비밀번호가 맞지 않습니다."
+    };
+  }
+
+  const now = nowIso();
+  await run(db, "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, row.id]);
+  const authSession = await createAuthSession(db, {
+    ...mapAuthUser(row),
+    lastLoginAt: now,
+    updatedAt: now
+  });
+
+  return {
+    ok: true as const,
+    session: authSession
+  };
+}
+
+async function logoutUser(db: D1Database, request: Request) {
+  const token = extractBearerToken(request);
+  if (!token) {
+    return {
+      ok: true as const
+    };
+  }
+
+  const tokenHash = await sha256Base64Url(token);
+  await run(db, "UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL", [nowIso(), tokenHash]);
+
+  return {
+    ok: true as const
+  };
+}
+
+async function authenticateRequest(request: Request, db: D1Database) {
+  const token = extractBearerToken(request);
+  if (!token) {
+    return null;
+  }
+
+  const tokenHash = await sha256Base64Url(token);
+  const sessionRow = await one<AuthSessionWithUserRow>(
+    db,
+    `SELECT
+       s.id,
+       s.user_id,
+       s.token_hash,
+       s.created_at,
+       s.expires_at,
+       s.last_seen_at,
+       s.revoked_at,
+       u.email,
+       u.name,
+       u.created_at as user_created_at,
+       u.updated_at as user_updated_at,
+       u.last_login_at
+     FROM auth_sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.token_hash = ?
+       AND s.revoked_at IS NULL
+     LIMIT 1`,
+    [tokenHash]
+  );
+
+  if (!sessionRow) {
+    return null;
+  }
+
+  const now = nowIso();
+  if (sessionRow.expires_at <= now) {
+    await run(db, "UPDATE auth_sessions SET revoked_at = ? WHERE id = ?", [now, sessionRow.id]);
+    return null;
+  }
+
+  await run(db, "UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?", [now, sessionRow.id]);
+
+  return {
+    user: mapAuthUserFromSession(sessionRow),
+    sessionId: sessionRow.id,
+    expiresAt: sessionRow.expires_at
+  };
+}
+
+async function createAuthSession(db: D1Database, user: AuthUser) {
+  const now = nowIso();
+  const token = randomToken(32);
+  const tokenHash = await sha256Base64Url(token);
+  const expiresAt = addDays(now, AUTH_SESSION_TTL_DAYS);
+
+  await run(
+    db,
+    `INSERT INTO auth_sessions (
+      id, user_id, token_hash, created_at, expires_at, last_seen_at, revoked_at
+    ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    [crypto.randomUUID(), user.id, tokenHash, now, expiresAt, now]
+  );
+
+  return {
+    authenticated: true,
+    token,
+    user,
+    expiresAt
+  } satisfies AuthTokenSession;
+}
+
+async function claimLegacyProfilesForFirstUser(db: D1Database, userId: string) {
+  const userCount = Number((await scalar<number>(db, "SELECT COUNT(*) FROM users", [])) ?? 0);
+  if (userCount !== 1) {
+    return;
+  }
+
+  await run(
+    db,
+    "UPDATE trend_profiles SET owner_user_id = ? WHERE owner_user_id IS NULL OR owner_user_id = ''",
+    [userId]
+  );
+}
+
+async function getTrendAdminBoard(db: D1Database, userId: string): Promise<TrendAdminBoard> {
+  const profiles = await listTrendProfiles(db, userId);
   const runs = await all<TrendCollectionRunRow>(
     db,
-    `SELECT *
-     FROM trend_runs
-     ORDER BY CASE status
+    `SELECT tr.*
+     FROM trend_runs tr
+     JOIN trend_profiles tp ON tp.id = tr.profile_id
+     WHERE tp.owner_user_id = ?
+     ORDER BY CASE tr.status
        WHEN 'running' THEN 0
        WHEN 'queued' THEN 1
        WHEN 'completed' THEN 2
@@ -260,16 +585,37 @@ async function getTrendAdminBoard(db: D1Database): Promise<TrendAdminBoard> {
        WHEN 'failed' THEN 4
        ELSE 5
      END,
-     updated_at DESC
-     LIMIT 8`
+     tr.updated_at DESC
+     LIMIT 8`,
+    [userId]
   );
   const runDetails = await Promise.all(runs.map((run) => buildRunBoardDetail(db, mapRun(run))));
-  const totalSnapshots = await scalar<number>(db, "SELECT COUNT(*) FROM trend_snapshots WHERE rank <= ?", [TREND_MAX_RANK]);
-  const failedTasks = await scalar<number>(db, "SELECT COUNT(*) FROM trend_tasks WHERE status = 'failed'", []);
+  const totalSnapshots = await scalar<number>(
+    db,
+    `SELECT COUNT(*)
+     FROM trend_snapshots ts
+     JOIN trend_profiles tp ON tp.id = ts.profile_id
+     WHERE tp.owner_user_id = ?
+       AND ts.rank <= ?`,
+    [userId, TREND_MAX_RANK]
+  );
+  const failedTasks = await scalar<number>(
+    db,
+    `SELECT COUNT(*)
+     FROM trend_tasks tt
+     JOIN trend_profiles tp ON tp.id = tt.profile_id
+     WHERE tp.owner_user_id = ?
+       AND tt.status = 'failed'`,
+    [userId]
+  );
   const queuedRuns = await scalar<number>(
     db,
-    "SELECT COUNT(*) FROM trend_runs WHERE status IN ('queued', 'running')",
-    []
+    `SELECT COUNT(*)
+     FROM trend_runs tr
+     JOIN trend_profiles tp ON tp.id = tr.profile_id
+     WHERE tp.owner_user_id = ?
+       AND tr.status IN ('queued', 'running')`,
+    [userId]
   );
   const latestSync = profiles
     .map((profile) => profile.lastSyncedAt)
@@ -311,6 +657,26 @@ async function getTrendAdminBoard(db: D1Database): Promise<TrendAdminBoard> {
     profiles,
     runs: runDetails
   };
+}
+
+async function getOwnedProfileRow(db: D1Database, userId: string, profileId: string) {
+  return one<TrendProfileRow>(
+    db,
+    "SELECT * FROM trend_profiles WHERE id = ? AND owner_user_id = ?",
+    [profileId, userId]
+  );
+}
+
+async function getOwnedRunRow(db: D1Database, userId: string, runId: string) {
+  return one<TrendCollectionRunRow>(
+    db,
+    `SELECT tr.*
+     FROM trend_runs tr
+     JOIN trend_profiles tp ON tp.id = tr.profile_id
+     WHERE tr.id = ?
+       AND tp.owner_user_id = ?`,
+    [runId, userId]
+  );
 }
 
 async function buildRunBoardDetail(db: D1Database, run: TrendCollectionRun): Promise<TrendRunDetail> {
@@ -395,12 +761,16 @@ async function buildRunBoardDetail(db: D1Database, run: TrendCollectionRun): Pro
   };
 }
 
-async function listTrendProfiles(db: D1Database): Promise<TrendProfile[]> {
-  const rows = await all<TrendProfileRow>(db, "SELECT * FROM trend_profiles ORDER BY updated_at DESC");
+async function listTrendProfiles(db: D1Database, userId: string): Promise<TrendProfile[]> {
+  const rows = await all<TrendProfileRow>(
+    db,
+    "SELECT * FROM trend_profiles WHERE owner_user_id = ? ORDER BY updated_at DESC",
+    [userId]
+  );
   return rows.map(mapProfile);
 }
 
-async function createTrendProfile(db: D1Database, input: TrendProfileInput) {
+async function createTrendProfile(db: D1Database, userId: string, input: TrendProfileInput) {
   const normalizedInput = normalizeTrendProfileInput(input);
 
   if (normalizedInput.timeUnit !== "month") {
@@ -451,13 +821,14 @@ async function createTrendProfile(db: D1Database, input: TrendProfileInput) {
   await run(
     db,
     `INSERT INTO trend_profiles (
-      id, slug, name, status, start_period, end_period, last_collected_period, last_synced_at, sync_status, latest_run_id,
+      id, slug, owner_user_id, name, status, start_period, end_period, last_collected_period, last_synced_at, sync_status, latest_run_id,
       created_at, updated_at, category_cid, category_path, category_depth, time_unit,
       devices_json, genders_json, ages_json, spreadsheet_id, result_count, exclude_brand_products, custom_excluded_terms_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       profile.id,
       profile.slug,
+      userId,
       profile.name,
       profile.status,
       profile.startPeriod,
@@ -488,7 +859,7 @@ async function createTrendProfile(db: D1Database, input: TrendProfileInput) {
   };
 }
 
-async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
+async function startTrendCollection(db: D1Database, user: AuthUser, input: TrendProfileInput) {
   const normalizedInput = normalizeTrendProfileInput(input);
 
   if (normalizedInput.timeUnit !== "month") {
@@ -503,7 +874,8 @@ async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
     db,
     `SELECT *
      FROM trend_profiles
-     WHERE category_cid = ?
+     WHERE owner_user_id = ?
+       AND category_cid = ?
        AND time_unit = 'month'
        AND devices_json = ?
        AND genders_json = ?
@@ -514,6 +886,7 @@ async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
      ORDER BY updated_at DESC
      LIMIT 1`,
     [
+      user.id,
       Number(normalizedInput.categoryCid),
       json(normalizedInput.devices),
       json(normalizedInput.genders),
@@ -528,7 +901,7 @@ async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
   let profile = existingProfileRow ? mapProfile(existingProfileRow) : null;
 
   if (!profileId) {
-    const created = await createTrendProfile(db, {
+    const created = await createTrendProfile(db, user.id, {
       ...normalizedInput
     });
 
@@ -587,7 +960,7 @@ async function startTrendCollection(db: D1Database, input: TrendProfileInput) {
     }
   }
 
-  const started = await startBackfill(db, profileId);
+  const started = await startBackfill(db, user, profileId);
   return started.ok
     ? {
         ...started,
@@ -683,8 +1056,8 @@ async function findReusableCompletedRun(db: D1Database, profile: TrendProfile): 
   return refreshed ? mapRun(refreshed) : null;
 }
 
-async function getTrendRun(db: D1Database, runId: string) {
-  const row = await one<TrendCollectionRunRow>(db, "SELECT * FROM trend_runs WHERE id = ?", [runId]);
+async function getTrendRun(db: D1Database, userId: string, runId: string) {
+  const row = await getOwnedRunRow(db, userId, runId);
 
   if (!row) {
     return {
@@ -700,8 +1073,8 @@ async function getTrendRun(db: D1Database, runId: string) {
   };
 }
 
-async function cancelTrendRun(db: D1Database, runId: string) {
-  const runRow = await one<TrendCollectionRunRow>(db, "SELECT * FROM trend_runs WHERE id = ?", [runId]);
+async function cancelTrendRun(db: D1Database, userId: string, runId: string) {
+  const runRow = await getOwnedRunRow(db, userId, runId);
 
   if (!runRow) {
     return {
@@ -794,8 +1167,8 @@ async function cancelTrendRun(db: D1Database, runId: string) {
   };
 }
 
-async function deleteTrendRun(db: D1Database, runId: string) {
-  const runRow = await one<TrendCollectionRunRow>(db, "SELECT * FROM trend_runs WHERE id = ?", [runId]);
+async function deleteTrendRun(db: D1Database, userId: string, runId: string) {
+  const runRow = await getOwnedRunRow(db, userId, runId);
 
   if (!runRow) {
     return {
@@ -848,8 +1221,14 @@ function normalizeTrendProfileInput(input: TrendProfileInput): TrendProfileInput
   };
 }
 
-async function getTrendRunSnapshotsPage(db: D1Database, runId: string, requestedPeriod: string, requestedPage: number) {
-  const runRow = await one<TrendCollectionRunRow>(db, "SELECT * FROM trend_runs WHERE id = ?", [runId]);
+async function getTrendRunSnapshotsPage(
+  db: D1Database,
+  userId: string,
+  runId: string,
+  requestedPeriod: string,
+  requestedPage: number
+) {
+  const runRow = await getOwnedRunRow(db, userId, runId);
 
   if (!runRow) {
     return {
@@ -923,8 +1302,8 @@ async function getTrendRunSnapshotsPage(db: D1Database, runId: string, requested
   };
 }
 
-async function retryFailedTasks(db: D1Database, runId: string) {
-  const runRow = await one<TrendCollectionRunRow>(db, "SELECT * FROM trend_runs WHERE id = ?", [runId]);
+async function retryFailedTasks(db: D1Database, userId: string, runId: string) {
+  const runRow = await getOwnedRunRow(db, userId, runId);
 
   if (!runRow) {
     return {
@@ -966,8 +1345,8 @@ async function retryFailedTasks(db: D1Database, runId: string) {
   };
 }
 
-async function startBackfill(db: D1Database, profileId: string) {
-  const profileRow = await one<TrendProfileRow>(db, "SELECT * FROM trend_profiles WHERE id = ?", [profileId]);
+async function startBackfill(db: D1Database, user: AuthUser, profileId: string) {
+  const profileRow = await getOwnedProfileRow(db, user.id, profileId);
 
   if (!profileRow) {
     return {
@@ -1033,7 +1412,7 @@ async function startBackfill(db: D1Database, profileId: string) {
     id: crypto.randomUUID(),
     profileId,
     status: uncachedPeriods.length ? "queued" : "completed",
-    requestedBy: DEFAULT_OPERATOR_ID,
+    requestedBy: user.email,
     runType: "backfill",
     startPeriod: profile.startPeriod,
     endPeriod: latestCollectiblePeriod,
@@ -1163,8 +1542,8 @@ async function startBackfill(db: D1Database, profileId: string) {
   };
 }
 
-async function syncProfileToSheets(env: Env, profileId: string) {
-  const profileRow = await one<TrendProfileRow>(dbFor(env), "SELECT * FROM trend_profiles WHERE id = ?", [profileId]);
+async function syncProfileToSheets(env: Env, userId: string, profileId: string) {
+  const profileRow = await getOwnedProfileRow(dbFor(env), userId, profileId);
 
   if (!profileRow) {
     return {
@@ -2290,12 +2669,67 @@ function summarizeFailureSnippet(value: string) {
 }
 
 function base64UrlEncode(value: string | ArrayBuffer) {
-  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value);
+  const bytes = typeof value === "string" ? textEncoder.encode(value) : new Uint8Array(value);
   let binary = "";
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function normalizeEmail(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function normalizeDisplayName(value: string | undefined, email: string) {
+  const trimmed = value?.trim();
+  if (trimmed) {
+    return trimmed.slice(0, 60);
+  }
+
+  return email.split("@")[0]?.slice(0, 60) || "한이룸 사용자";
+}
+
+function addDays(isoDate: string, days: number) {
+  const next = new Date(isoDate);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next.toISOString();
+}
+
+function extractBearerToken(request: Request) {
+  const header = request.headers.get("authorization")?.trim() ?? "";
+  if (!header.toLowerCase().startsWith("bearer ")) {
+    return null;
+  }
+
+  const token = header.slice(7).trim();
+  return token || null;
+}
+
+function randomToken(byteLength: number) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncode(bytes.buffer);
+}
+
+async function sha256Base64Url(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(value));
+  return base64UrlEncode(digest);
+}
+
+async function hashPassword(password: string, salt: string) {
+  const keyMaterial = await crypto.subtle.importKey("raw", textEncoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: textEncoder.encode(salt),
+      iterations: AUTH_PASSWORD_ITERATIONS,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    256
+  );
+  return base64UrlEncode(bits);
 }
 
 function json(value: unknown) {
@@ -2327,6 +2761,28 @@ function mapProfile(row: TrendProfileRow): TrendProfile {
     genders: parseJson<TrendGenderCode[]>(row.genders_json, []),
     ages: parseJson<TrendAgeCode[]>(row.ages_json, []),
     spreadsheetId: row.spreadsheet_id
+  };
+}
+
+function mapAuthUser(row: AuthUserRow): AuthUser {
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastLoginAt: row.last_login_at ?? undefined
+  };
+}
+
+function mapAuthUserFromSession(row: AuthSessionWithUserRow): AuthUser {
+  return {
+    id: row.user_id,
+    email: row.email,
+    name: row.name,
+    createdAt: row.user_created_at,
+    updatedAt: row.user_updated_at,
+    lastLoginAt: row.last_login_at ?? undefined
   };
 }
 
@@ -2442,9 +2898,39 @@ async function ensureSchema(db: D1Database) {
 }
 
 async function applySchemaChanges(db: D1Database) {
+  await run(
+    db,
+    `CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      email_normalized TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_login_at TEXT
+    )`
+  );
+  await run(
+    db,
+    `CREATE TABLE IF NOT EXISTS auth_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen_at TEXT,
+      revoked_at TEXT
+    )`
+  );
   const profileColumns = new Set(
     (await all<{ name: string }>(db, "PRAGMA table_info(trend_profiles)")).map((column) => column.name)
   );
+
+  if (!profileColumns.has("owner_user_id")) {
+    await run(db, "ALTER TABLE trend_profiles ADD COLUMN owner_user_id TEXT");
+  }
 
   if (!profileColumns.has("result_count")) {
     await run(db, "ALTER TABLE trend_profiles ADD COLUMN result_count INTEGER NOT NULL DEFAULT 20");
@@ -2497,11 +2983,43 @@ async function applySchemaChanges(db: D1Database) {
   if (!taskColumns.has("next_attempt_at")) {
     await run(db, "ALTER TABLE trend_tasks ADD COLUMN next_attempt_at TEXT");
   }
+
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_trend_profiles_owner_user_id ON trend_profiles(owner_user_id)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_sessions_token_hash ON auth_sessions(token_hash)");
+}
+
+interface AuthUserRow {
+  id: string;
+  email: string;
+  email_normalized: string;
+  name: string;
+  password_hash: string;
+  password_salt: string;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+}
+
+interface AuthSessionWithUserRow {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  created_at: string;
+  expires_at: string;
+  last_seen_at: string | null;
+  revoked_at: string | null;
+  email: string;
+  name: string;
+  user_created_at: string;
+  user_updated_at: string;
+  last_login_at: string | null;
 }
 
 interface TrendProfileRow {
   id: string;
   slug: string;
+  owner_user_id?: string | null;
   name: string;
   status: string;
   start_period: string;
