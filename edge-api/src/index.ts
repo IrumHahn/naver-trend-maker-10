@@ -39,6 +39,9 @@ type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 interface Env {
   DB: D1Database;
   APP_NAME?: string;
+  GOOGLE_OAUTH_CLIENT_ID?: string;
+  GOOGLE_OAUTH_CLIENT_SECRET?: string;
+  AUTH_ALLOWED_RETURN_ORIGINS?: string;
   GOOGLE_SHEETS_SERVICE_ACCOUNT_EMAIL?: string;
   GOOGLE_SHEETS_PRIVATE_KEY?: string;
 }
@@ -75,12 +78,21 @@ const NAVER_BASE_URL = "https://datalab.naver.com";
 const NAVER_CATEGORY_PAGE_URL = `${NAVER_BASE_URL}/shoppingInsight/sCategory.naver`;
 const NAVER_BROWSER_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+const GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const GOOGLE_OAUTH_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo";
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
   "access-control-allow-headers": "content-type, authorization"
 };
+const DEFAULT_ALLOWED_AUTH_RETURN_ORIGINS = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://hanirum-sourcing-maker-10.pages.dev",
+  "https://*.hanirum-sourcing-maker-10.pages.dev"
+] as const;
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const PROCESS_BATCH_MAX_TASKS = 8;
 const PROCESS_BATCH_MAX_WALL_MS = 25_000;
@@ -89,6 +101,7 @@ const NAVER_INTER_MONTH_DELAY_JITTER_MS = 450;
 const TASK_AUTO_RETRY_LIMIT = 4;
 const AUTH_PASSWORD_ITERATIONS = 160_000;
 const AUTH_SESSION_TTL_DAYS = 30;
+const AUTH_OAUTH_STATE_TTL_MINUTES = 15;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const textEncoder = new TextEncoder();
 let schemaReadyPromise: Promise<void> | null = null;
@@ -121,6 +134,14 @@ export default {
       if (request.method === "POST" && pathname === "/v1/auth/login") {
         const body = (await request.json()) as AuthLoginInput;
         return respondJson(await loginUser(env.DB, body));
+      }
+
+      if (request.method === "GET" && pathname === "/v1/auth/google/start") {
+        return respondJson(await beginGoogleAuth(env.DB, request, env));
+      }
+
+      if (request.method === "GET" && pathname === "/v1/auth/google/callback") {
+        return await handleGoogleAuthCallback(env.DB, request, env);
       }
 
       if (request.method === "POST" && pathname === "/v1/auth/logout") {
@@ -375,6 +396,119 @@ async function getSessionState(db: D1Database, request: Request) {
   };
 }
 
+async function beginGoogleAuth(db: D1Database, request: Request, env: Env) {
+  const googleAuthConfig = getGoogleAuthConfig(env);
+  if (!googleAuthConfig) {
+    return {
+      ok: false as const,
+      code: "GOOGLE_AUTH_NOT_CONFIGURED",
+      message: "Google 로그인 설정이 아직 완료되지 않았습니다. 관리자에게 OAuth 클라이언트 설정을 요청해 주세요."
+    };
+  }
+
+  const requestUrl = new URL(request.url);
+  const returnTo = resolveSafeReturnTo(request, requestUrl.searchParams.get("return_to"), env);
+  if (!returnTo) {
+    return {
+      ok: false as const,
+      code: "INVALID_RETURN_URL",
+      message: "로그인 완료 후 돌아갈 화면 주소를 확인하지 못했습니다. 다시 시도해 주세요."
+    };
+  }
+
+  const now = nowIso();
+  const state = randomToken(24);
+  const expiresAt = addMinutes(now, AUTH_OAUTH_STATE_TTL_MINUTES);
+
+  await run(db, "DELETE FROM auth_oauth_states WHERE expires_at <= ? OR used_at IS NOT NULL", [now]);
+  await run(
+    db,
+    `INSERT INTO auth_oauth_states (
+      id, provider, state, return_to, created_at, expires_at, used_at
+    ) VALUES (?, 'google', ?, ?, ?, ?, NULL)`,
+    [crypto.randomUUID(), state, returnTo, now, expiresAt]
+  );
+
+  const authorizationUrl = new URL(GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT);
+  authorizationUrl.search = new URLSearchParams({
+    client_id: googleAuthConfig.clientId,
+    redirect_uri: buildGoogleOauthRedirectUri(request),
+    response_type: "code",
+    scope: "openid email profile",
+    prompt: "select_account",
+    state,
+    include_granted_scopes: "true"
+  }).toString();
+
+  return {
+    ok: true as const,
+    authorizationUrl: authorizationUrl.toString()
+  };
+}
+
+async function handleGoogleAuthCallback(db: D1Database, request: Request, env: Env) {
+  const googleAuthConfig = getGoogleAuthConfig(env);
+  if (!googleAuthConfig) {
+    return respondHtml("Google 로그인 설정이 아직 완료되지 않았습니다.", 503);
+  }
+
+  const requestUrl = new URL(request.url);
+  const state = requestUrl.searchParams.get("state")?.trim() ?? "";
+  if (!state) {
+    return respondHtml("Google 로그인 상태값이 누락되었습니다. 다시 시도해 주세요.", 400);
+  }
+
+  const stateRow = await one<AuthOauthStateRow>(
+    db,
+    "SELECT * FROM auth_oauth_states WHERE provider = 'google' AND state = ? LIMIT 1",
+    [state]
+  );
+  if (!stateRow) {
+    return respondHtml("Google 로그인 상태를 찾지 못했습니다. 다시 시도해 주세요.", 400);
+  }
+
+  const now = nowIso();
+  const returnTo = stateRow.return_to;
+  if (stateRow.used_at || stateRow.expires_at <= now) {
+    return redirectToClientReturn(returnTo, {
+      auth_error: "GOOGLE_STATE_EXPIRED"
+    });
+  }
+
+  await run(db, "UPDATE auth_oauth_states SET used_at = ? WHERE id = ? AND used_at IS NULL", [now, stateRow.id]);
+
+  const googleError = requestUrl.searchParams.get("error")?.trim();
+  if (googleError) {
+    return redirectToClientReturn(returnTo, {
+      auth_error: mapGoogleOauthErrorCode(googleError)
+    });
+  }
+
+  const code = requestUrl.searchParams.get("code")?.trim() ?? "";
+  if (!code) {
+    return redirectToClientReturn(returnTo, {
+      auth_error: "GOOGLE_CODE_MISSING"
+    });
+  }
+
+  try {
+    const token = await exchangeGoogleAuthorizationCode(request, googleAuthConfig, code);
+    const googleUser = await fetchGoogleUserInfo(token.accessToken);
+    const authUser = await upsertGoogleUser(db, googleUser);
+    const authSession = await createAuthSession(db, authUser);
+
+    return redirectToClientReturn(returnTo, {
+      auth_token: authSession.token,
+      auth_provider: "google"
+    });
+  } catch (error) {
+    console.error("google auth callback failed", error);
+    return redirectToClientReturn(returnTo, {
+      auth_error: "GOOGLE_LOGIN_FAILED"
+    });
+  }
+}
+
 async function registerUser(db: D1Database, input: AuthRegisterInput) {
   const email = normalizeEmail(input.email);
   const password = input.password ?? "";
@@ -554,6 +688,105 @@ async function createAuthSession(db: D1Database, user: AuthUser) {
     user,
     expiresAt
   } satisfies AuthTokenSession;
+}
+
+async function upsertGoogleUser(db: D1Database, googleUser: GoogleUserInfo) {
+  if (!googleUser.sub || !googleUser.email || !googleUser.email_verified) {
+    throw new Error("Google account is missing a verified email address.");
+  }
+
+  const email = normalizeEmail(googleUser.email);
+  const now = nowIso();
+  const existingByGoogleSubject = await one<AuthUserRow>(db, "SELECT * FROM users WHERE google_subject = ? LIMIT 1", [googleUser.sub]);
+  const existingByEmail =
+    existingByGoogleSubject ?? (await one<AuthUserRow>(db, "SELECT * FROM users WHERE email_normalized = ? LIMIT 1", [email]));
+
+  if (existingByEmail) {
+    if (existingByEmail.google_subject && existingByEmail.google_subject !== googleUser.sub) {
+      throw new Error("Google account conflict detected for existing email.");
+    }
+
+    const nextName = existingByEmail.name?.trim() || normalizeDisplayName(googleUser.name, email);
+    await run(
+      db,
+      "UPDATE users SET google_subject = COALESCE(google_subject, ?), name = ?, last_login_at = ?, updated_at = ? WHERE id = ?",
+      [googleUser.sub, nextName, now, now, existingByEmail.id]
+    );
+
+    return {
+      ...mapAuthUser(existingByEmail),
+      name: nextName,
+      updatedAt: now,
+      lastLoginAt: now
+    } satisfies AuthUser;
+  }
+
+  const passwordSalt = randomToken(16);
+  const passwordHash = randomToken(32);
+  const user: AuthUser = {
+    id: crypto.randomUUID(),
+    email,
+    name: normalizeDisplayName(googleUser.name, email),
+    createdAt: now,
+    updatedAt: now,
+    lastLoginAt: now
+  };
+
+  await run(
+    db,
+    `INSERT INTO users (
+      id, email, email_normalized, name, google_subject, password_hash, password_salt, created_at, updated_at, last_login_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user.id, user.email, email, user.name, googleUser.sub, passwordHash, passwordSalt, user.createdAt, user.updatedAt, now]
+  );
+
+  await claimLegacyProfilesForFirstUser(db, user.id);
+  return user;
+}
+
+async function exchangeGoogleAuthorizationCode(request: Request, config: GoogleAuthConfig, code: string) {
+  const response = await fetch(GOOGLE_OAUTH_TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      code,
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      redirect_uri: buildGoogleOauthRedirectUri(request),
+      grant_type: "authorization_code"
+    }).toString()
+  });
+
+  if (!response.ok) {
+    const failureText = await response.text();
+    throw new Error(`Google token exchange failed (${response.status}): ${failureText.slice(0, 180)}`);
+  }
+
+  const payload = (await response.json()) as Partial<GoogleTokenResponse>;
+  if (!payload.access_token) {
+    throw new Error("Google token response did not include an access token.");
+  }
+
+  return {
+    accessToken: payload.access_token
+  };
+}
+
+async function fetchGoogleUserInfo(accessToken: string) {
+  const response = await fetch(GOOGLE_OAUTH_USERINFO_ENDPOINT, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  if (!response.ok) {
+    const failureText = await response.text();
+    throw new Error(`Google userinfo request failed (${response.status}): ${failureText.slice(0, 180)}`);
+  }
+
+  return (await response.json()) as GoogleUserInfo;
 }
 
 async function claimLegacyProfilesForFirstUser(db: D1Database, userId: string) {
@@ -2696,6 +2929,12 @@ function addDays(isoDate: string, days: number) {
   return next.toISOString();
 }
 
+function addMinutes(isoDate: string, minutes: number) {
+  const next = new Date(isoDate);
+  next.setUTCMinutes(next.getUTCMinutes() + minutes);
+  return next.toISOString();
+}
+
 function extractBearerToken(request: Request) {
   const header = request.headers.get("authorization")?.trim() ?? "";
   if (!header.toLowerCase().startsWith("bearer ")) {
@@ -2710,6 +2949,114 @@ function randomToken(byteLength: number) {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);
   return base64UrlEncode(bytes.buffer);
+}
+
+function getGoogleAuthConfig(env: Env): GoogleAuthConfig | null {
+  const clientId = stripWrappingQuotes(env.GOOGLE_OAUTH_CLIENT_ID?.trim() ?? "");
+  const clientSecret = stripWrappingQuotes(env.GOOGLE_OAUTH_CLIENT_SECRET?.trim() ?? "");
+
+  if (!clientId || !clientSecret) {
+    return null;
+  }
+
+  return {
+    clientId,
+    clientSecret
+  };
+}
+
+function buildGoogleOauthRedirectUri(request: Request) {
+  const url = new URL(request.url);
+  return `${url.origin}/v1/auth/google/callback`;
+}
+
+function resolveSafeReturnTo(request: Request, requestedReturnTo: string | null, env: Env) {
+  if (!requestedReturnTo) {
+    return null;
+  }
+
+  let returnUrl: URL;
+  try {
+    returnUrl = new URL(requestedReturnTo);
+  } catch {
+    return null;
+  }
+
+  if (!["http:", "https:"].includes(returnUrl.protocol)) {
+    return null;
+  }
+
+  const requestedOrigin = returnUrl.origin;
+  const allowedOrigins = [
+    ...DEFAULT_ALLOWED_AUTH_RETURN_ORIGINS,
+    ...parseCsvList(env.AUTH_ALLOWED_RETURN_ORIGINS)
+  ];
+  const requestOrigin = request.headers.get("origin");
+  const refererOrigin = getRequestOrigin(request.headers.get("referer"));
+
+  if (requestOrigin === requestedOrigin || refererOrigin === requestedOrigin || originMatchesAllowedPatterns(requestedOrigin, allowedOrigins)) {
+    return `${returnUrl.origin}${returnUrl.pathname}${returnUrl.search}`;
+  }
+
+  return null;
+}
+
+function originMatchesAllowedPatterns(origin: string, patterns: readonly string[]) {
+  return patterns.some((pattern) => {
+    const trimmed = pattern.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (trimmed.includes("*.")) {
+      const [protocol, hostPattern] = trimmed.split("://");
+      if (!protocol || !hostPattern.startsWith("*.")) {
+        return false;
+      }
+
+      const suffix = hostPattern.slice(1);
+
+      try {
+        const candidate = new URL(origin);
+        return candidate.protocol === `${protocol}:` && (candidate.hostname === suffix.slice(1) || candidate.hostname.endsWith(suffix));
+      } catch {
+        return false;
+      }
+    }
+
+    return trimmed === origin;
+  });
+}
+
+function getRequestOrigin(value: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function parseCsvList(value: string | undefined) {
+  return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
+function redirectToClientReturn(returnTo: string, params: Record<string, string>) {
+  const url = new URL(returnTo);
+  url.hash = new URLSearchParams(params).toString();
+  return Response.redirect(url.toString(), 302);
+}
+
+function mapGoogleOauthErrorCode(code: string) {
+  switch (code) {
+    case "access_denied":
+      return "GOOGLE_ACCESS_DENIED";
+    default:
+      return "GOOGLE_LOGIN_FAILED";
+  }
 }
 
 async function sha256Base64Url(value: string) {
@@ -2857,6 +3204,29 @@ function parseJson<T>(value: string | null, fallback: T): T {
   }
 }
 
+function respondHtml(message: string, status = 200) {
+  return new Response(
+    `<!doctype html><html lang="ko"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>한이룸 네이버 트렌드 마법사</title></head><body style="font-family:Pretendard,system-ui,sans-serif;background:#f7f4ef;color:#233847;padding:32px;"><main style="max-width:520px;margin:10vh auto;padding:24px;border-radius:24px;background:#fff;border:1px solid rgba(19,34,44,0.08);box-shadow:0 18px 34px rgba(26,44,61,0.08);"><h1 style="margin:0 0 12px;font-size:28px;line-height:1.15;">Google 로그인 안내</h1><p style="margin:0;font-size:16px;line-height:1.7;">${escapeHtml(
+      message
+    )}</p></main></body></html>`,
+    {
+      status,
+      headers: {
+        "content-type": "text/html; charset=utf-8"
+      }
+    }
+  );
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 async function run(db: D1Database, sql: string, params: unknown[] = []) {
   return db.prepare(sql).bind(...params).run();
 }
@@ -2905,6 +3275,7 @@ async function applySchemaChanges(db: D1Database) {
       email TEXT NOT NULL,
       email_normalized TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
+      google_subject TEXT,
       password_hash TEXT NOT NULL,
       password_salt TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -2924,6 +3295,24 @@ async function applySchemaChanges(db: D1Database) {
       revoked_at TEXT
     )`
   );
+  await run(
+    db,
+    `CREATE TABLE IF NOT EXISTS auth_oauth_states (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      state TEXT NOT NULL UNIQUE,
+      return_to TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    )`
+  );
+  const userColumns = new Set((await all<{ name: string }>(db, "PRAGMA table_info(users)")).map((column) => column.name));
+
+  if (!userColumns.has("google_subject")) {
+    await run(db, "ALTER TABLE users ADD COLUMN google_subject TEXT");
+  }
+
   const profileColumns = new Set(
     (await all<{ name: string }>(db, "PRAGMA table_info(trend_profiles)")).map((column) => column.name)
   );
@@ -2987,6 +3376,9 @@ async function applySchemaChanges(db: D1Database) {
   await run(db, "CREATE INDEX IF NOT EXISTS idx_trend_profiles_owner_user_id ON trend_profiles(owner_user_id)");
   await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id)");
   await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_sessions_token_hash ON auth_sessions(token_hash)");
+  await run(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_subject ON users(google_subject)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_provider_state ON auth_oauth_states(provider, state)");
+  await run(db, "CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_expires_at ON auth_oauth_states(expires_at)");
 }
 
 interface AuthUserRow {
@@ -2994,11 +3386,38 @@ interface AuthUserRow {
   email: string;
   email_normalized: string;
   name: string;
+  google_subject: string | null;
   password_hash: string;
   password_salt: string;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
+}
+
+interface AuthOauthStateRow {
+  id: string;
+  provider: string;
+  state: string;
+  return_to: string;
+  created_at: string;
+  expires_at: string;
+  used_at: string | null;
+}
+
+interface GoogleAuthConfig {
+  clientId: string;
+  clientSecret: string;
+}
+
+interface GoogleTokenResponse {
+  access_token: string;
+}
+
+interface GoogleUserInfo {
+  sub: string;
+  email: string;
+  email_verified: boolean;
+  name?: string;
 }
 
 interface AuthSessionWithUserRow {

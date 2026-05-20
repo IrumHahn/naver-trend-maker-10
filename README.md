@@ -30,7 +30,8 @@ pnpm --filter @runacademy/web dev
 선택 사항:
 
 - 로컬에서 Worker까지 같이 확인하려면 `npx wrangler dev --config edge-api/wrangler.jsonc`를 함께 실행합니다.
-- 프론트는 개발 환경에서 `NEXT_PUBLIC_API_BASE_URL`이 없으면 기본적으로 `http://127.0.0.1:8787/v1`을 바라봅니다.
+- 프론트는 개발 환경에서 `NEXT_PUBLIC_API_BASE_URL`이 없으면 기본적으로 공용 API `https://naver-trend-maker-api.redpill-han.workers.dev/v1`을 바라봅니다.
+- 로컬 Worker를 직접 붙이고 싶다면 `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8787/v1`로 따로 지정해 주세요.
 
 관리자 화면:
 
@@ -85,10 +86,42 @@ NEXT_PUBLIC_API_BASE_URL=https://your-shared-api.your-subdomain.workers.dev/v1
 
 - `POST /v1/auth/register`
 - `POST /v1/auth/login`
+- `GET /v1/auth/google/start`
+- `GET /v1/auth/google/callback`
 - `GET /v1/auth/session`
 - `POST /v1/auth/logout`
 
 트렌드 프로필, 수집 런, 스냅샷 조회는 로그인된 사용자 토큰 기준으로만 접근됩니다. 월별 원본 캐시는 같은 조건이면 재사용될 수 있지만, 화면에 보이는 작업 히스토리와 런 상세는 사용자별로 분리됩니다.
+
+### 7. Google 로그인 활성화
+
+Google 로그인까지 쓰려면 Google Cloud Console에서 OAuth 웹 클라이언트를 만든 뒤 Worker secret을 추가해야 합니다.
+
+승인된 리디렉션 URI 예시:
+
+```text
+https://your-worker-name.your-subdomain.workers.dev/v1/auth/google/callback
+```
+
+Worker secret 설정:
+
+```bash
+pnpm wrangler secret put GOOGLE_OAUTH_CLIENT_ID
+pnpm wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET
+```
+
+선택 환경변수:
+
+```text
+AUTH_ALLOWED_RETURN_ORIGINS=https://your-pages-domain.pages.dev,https://*.your-pages-domain.pages.dev,http://localhost:3000,http://127.0.0.1:3000
+```
+
+별도 설정이 없더라도 기본적으로 아래 주소는 허용됩니다.
+
+- `http://localhost:3000`
+- `http://127.0.0.1:3000`
+- `https://hanirum-sourcing-maker-10.pages.dev`
+- `https://*.hanirum-sourcing-maker-10.pages.dev`
 
 ## 참고 문서
 

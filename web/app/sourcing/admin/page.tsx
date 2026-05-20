@@ -52,7 +52,7 @@ import styles from "./admin.module.css";
 
 const ENV_API_BASE_URL = normalizeApiBaseUrl(process.env.NEXT_PUBLIC_API_BASE_URL ?? "");
 const AUTH_TOKEN_STORAGE_KEY = "hanirum:naver-trend-auth-token";
-const LOCAL_DEV_API_BASE_URL = "http://127.0.0.1:8787/v1";
+const LOCAL_DEV_API_BASE_URL = "https://naver-trend-maker-api.redpill-han.workers.dev/v1";
 
 const DEVICE_OPTIONS = [
   ["pc", "PC"],
@@ -139,6 +139,7 @@ type AuthFormState = {
 
 type AuthSessionResponse = ApiError | { ok: true; session: AuthSessionState };
 type AuthTokenSessionResponse = ApiError | { ok: true; session: AuthTokenSession };
+type AuthGoogleStartResponse = ApiError | { ok: true; authorizationUrl: string };
 
 const initialForm: TrendFormState = {
   category1: "",
@@ -234,13 +235,33 @@ export default function SourcingAdminPage() {
     let cancelled = false;
 
     async function restoreSession() {
+      const redirectPayload = consumeAuthRedirectPayload();
+      if (redirectPayload.error) {
+        setError(getAuthRedirectErrorMessage(redirectPayload.error));
+        setFeedback({
+          tone: "error",
+          text: getAuthRedirectErrorMessage(redirectPayload.error)
+        });
+      }
+
+      if (redirectPayload.token) {
+        window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, redirectPayload.token);
+        setFeedback({
+          tone: "success",
+          text:
+            redirectPayload.provider === "google"
+              ? "Google 계정으로 로그인되었습니다. 바로 내 작업 결과를 이어서 볼 수 있어요."
+              : "로그인이 완료되었습니다."
+        });
+      }
+
       if (!apiBaseUrl) {
         setAuthState({ authenticated: false });
         setAuthReady(true);
         return;
       }
 
-      const storedToken = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? "";
+      const storedToken = redirectPayload.token || window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
       if (!storedToken) {
         setAuthState({ authenticated: false });
         setAuthReady(true);
@@ -491,6 +512,34 @@ export default function SourcingAdminPage() {
   function handleAuthFormSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     void handleAuthSubmit();
+  }
+
+  async function handleGoogleAuthStart() {
+    if (!apiBaseUrl) {
+      setError("공용 API 주소가 아직 연결되지 않았습니다. 배포 환경변수 NEXT_PUBLIC_API_BASE_URL을 확인해 주세요.");
+      return;
+    }
+
+    setAuthSubmitting(true);
+    setError(null);
+
+    const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+    const response = await api<AuthGoogleStartResponse>(
+      apiBaseUrl,
+      `/auth/google/start?return_to=${encodeURIComponent(returnTo)}`
+    );
+
+    if (!response.ok) {
+      setAuthSubmitting(false);
+      setError(response.message ?? "Google 로그인 연결을 시작하지 못했습니다.");
+      setFeedback({
+        tone: "error",
+        text: response.message ?? "Google 로그인 연결을 시작하지 못했습니다."
+      });
+      return;
+    }
+
+    window.location.assign(response.authorizationUrl);
   }
 
   async function handleLogout() {
@@ -901,6 +950,25 @@ export default function SourcingAdminPage() {
             </div>
           ) : (
             <div className={styles.setupPanel}>
+              <div className={styles.authProviderStack}>
+                <button className={styles.googleButton} type="button" onClick={() => void handleGoogleAuthStart()} disabled={authSubmitting}>
+                  {authSubmitting ? (
+                    <LoaderCircle className={styles.spinningIcon} size={16} />
+                  ) : (
+                    <span className={styles.googleMark} aria-hidden="true">
+                      G
+                    </span>
+                  )}
+                  Google로 3초 로그인
+                  <ExternalLink size={15} />
+                </button>
+                <p className={styles.providerNote}>회원가입 없이 바로 시작하고 싶다면 Google 로그인을 사용해도 됩니다.</p>
+              </div>
+
+              <div className={styles.providerDivider} role="presentation">
+                <span>또는 이메일로 계속하기</span>
+              </div>
+
               <form onSubmit={handleAuthFormSubmit}>
                 <div className={styles.formGrid}>
                   {authMode === "register" ? (
@@ -2747,6 +2815,62 @@ function mergeRunDetail(previous: TrendRunDetail, next: TrendRunDetail) {
 
 function getInitialApiBaseUrl() {
   return ENV_API_BASE_URL;
+}
+
+function consumeAuthRedirectPayload() {
+  if (typeof window === "undefined") {
+    return {
+      token: "",
+      provider: "",
+      error: ""
+    };
+  }
+
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  if (!hash) {
+    return {
+      token: "",
+      provider: "",
+      error: ""
+    };
+  }
+
+  const params = new URLSearchParams(hash);
+  const token = params.get("auth_token")?.trim() ?? "";
+  const provider = params.get("auth_provider")?.trim() ?? "";
+  const error = params.get("auth_error")?.trim() ?? "";
+
+  if (!token && !provider && !error) {
+    return {
+      token: "",
+      provider: "",
+      error: ""
+    };
+  }
+
+  const nextUrl = `${window.location.pathname}${window.location.search}`;
+  window.history.replaceState({}, document.title, nextUrl);
+
+  return {
+    token,
+    provider,
+    error
+  };
+}
+
+function getAuthRedirectErrorMessage(code: string) {
+  switch (code) {
+    case "GOOGLE_ACCESS_DENIED":
+      return "Google 로그인 권한 동의가 취소되었습니다. 다시 눌러서 이어갈 수 있습니다.";
+    case "GOOGLE_STATE_EXPIRED":
+      return "Google 로그인 준비 시간이 만료되었습니다. 다시 한 번 로그인 버튼을 눌러 주세요.";
+    case "GOOGLE_CODE_MISSING":
+      return "Google 로그인 승인 코드가 누락되어 다시 시작이 필요합니다.";
+    case "GOOGLE_LOGIN_FAILED":
+      return "Google 로그인 연결 중 문제가 생겼습니다. 잠시 후 다시 시도해 주세요.";
+    default:
+      return "로그인 연결을 마무리하지 못했습니다. 다시 시도해 주세요.";
+  }
 }
 
 function normalizeApiBaseUrl(value: string) {

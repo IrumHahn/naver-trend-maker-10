@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NOT NULL,
   email_normalized TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
+  google_subject TEXT,
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -18,6 +19,16 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
   expires_at TEXT NOT NULL,
   last_seen_at TEXT,
   revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_oauth_states (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  state TEXT NOT NULL UNIQUE,
+  return_to TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trend_profiles (
@@ -120,3 +131,6 @@ CREATE INDEX IF NOT EXISTS idx_trend_snapshots_run_id ON trend_snapshots(run_id)
 CREATE INDEX IF NOT EXISTS idx_trend_profiles_owner_user_id ON trend_profiles(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_token_hash ON auth_sessions(token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_subject ON users(google_subject);
+CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_provider_state ON auth_oauth_states(provider, state);
+CREATE INDEX IF NOT EXISTS idx_auth_oauth_states_expires_at ON auth_oauth_states(expires_at);
