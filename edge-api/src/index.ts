@@ -99,7 +99,7 @@ const PROCESS_BATCH_MAX_WALL_MS = 25_000;
 const NAVER_INTER_MONTH_DELAY_MS = 650;
 const NAVER_INTER_MONTH_DELAY_JITTER_MS = 450;
 const TASK_AUTO_RETRY_LIMIT = 4;
-const AUTH_PASSWORD_ITERATIONS = 160_000;
+const AUTH_PASSWORD_ITERATIONS = 100_000;
 const AUTH_SESSION_TTL_DAYS = 30;
 const AUTH_OAUTH_STATE_TTL_MINUTES = 15;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -553,12 +553,11 @@ async function registerUser(db: D1Database, input: AuthRegisterInput) {
   await run(
     db,
     `INSERT INTO users (
-      id, email, email_normalized, name, password_hash, password_salt, created_at, updated_at, last_login_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [user.id, user.email, email, user.name, passwordHash, passwordSalt, user.createdAt, user.updatedAt, now]
+      id, email, email_normalized, name, password_hash, password_salt, password_iterations, created_at, updated_at, last_login_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user.id, user.email, email, user.name, passwordHash, passwordSalt, AUTH_PASSWORD_ITERATIONS, user.createdAt, user.updatedAt, now]
   );
 
-  await claimLegacyProfilesForFirstUser(db, user.id);
   const authSession = await createAuthSession(db, user);
 
   return {
@@ -580,7 +579,7 @@ async function loginUser(db: D1Database, input: AuthLoginInput) {
     };
   }
 
-  const passwordHash = await hashPassword(password, row.password_salt);
+  const passwordHash = await hashPassword(password, row.password_salt, normalizePasswordIterations(row.password_iterations));
   if (passwordHash !== row.password_hash) {
     return {
       ok: false as const,
@@ -735,12 +734,11 @@ async function upsertGoogleUser(db: D1Database, googleUser: GoogleUserInfo) {
   await run(
     db,
     `INSERT INTO users (
-      id, email, email_normalized, name, google_subject, password_hash, password_salt, created_at, updated_at, last_login_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [user.id, user.email, email, user.name, googleUser.sub, passwordHash, passwordSalt, user.createdAt, user.updatedAt, now]
+      id, email, email_normalized, name, google_subject, password_hash, password_salt, password_iterations, created_at, updated_at, last_login_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user.id, user.email, email, user.name, googleUser.sub, passwordHash, passwordSalt, AUTH_PASSWORD_ITERATIONS, user.createdAt, user.updatedAt, now]
   );
 
-  await claimLegacyProfilesForFirstUser(db, user.id);
   return user;
 }
 
@@ -787,19 +785,6 @@ async function fetchGoogleUserInfo(accessToken: string) {
   }
 
   return (await response.json()) as GoogleUserInfo;
-}
-
-async function claimLegacyProfilesForFirstUser(db: D1Database, userId: string) {
-  const userCount = Number((await scalar<number>(db, "SELECT COUNT(*) FROM users", [])) ?? 0);
-  if (userCount !== 1) {
-    return;
-  }
-
-  await run(
-    db,
-    "UPDATE trend_profiles SET owner_user_id = ? WHERE owner_user_id IS NULL OR owner_user_id = ''",
-    [userId]
-  );
 }
 
 async function getTrendAdminBoard(db: D1Database, userId: string): Promise<TrendAdminBoard> {
@@ -3064,19 +3049,28 @@ async function sha256Base64Url(value: string) {
   return base64UrlEncode(digest);
 }
 
-async function hashPassword(password: string, salt: string) {
+async function hashPassword(password: string, salt: string, iterations = AUTH_PASSWORD_ITERATIONS) {
   const keyMaterial = await crypto.subtle.importKey("raw", textEncoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
     {
       name: "PBKDF2",
       salt: textEncoder.encode(salt),
-      iterations: AUTH_PASSWORD_ITERATIONS,
+      iterations,
       hash: "SHA-256"
     },
     keyMaterial,
     256
   );
   return base64UrlEncode(bits);
+}
+
+function normalizePasswordIterations(value: number | string | null | undefined) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 10_000) {
+    return AUTH_PASSWORD_ITERATIONS;
+  }
+
+  return Math.min(Math.trunc(parsed), AUTH_PASSWORD_ITERATIONS);
 }
 
 function json(value: unknown) {
@@ -3278,6 +3272,7 @@ async function applySchemaChanges(db: D1Database) {
       google_subject TEXT,
       password_hash TEXT NOT NULL,
       password_salt TEXT NOT NULL,
+      password_iterations INTEGER NOT NULL DEFAULT 100000,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       last_login_at TEXT
@@ -3311,6 +3306,10 @@ async function applySchemaChanges(db: D1Database) {
 
   if (!userColumns.has("google_subject")) {
     await run(db, "ALTER TABLE users ADD COLUMN google_subject TEXT");
+  }
+
+  if (!userColumns.has("password_iterations")) {
+    await run(db, "ALTER TABLE users ADD COLUMN password_iterations INTEGER NOT NULL DEFAULT 100000");
   }
 
   const profileColumns = new Set(
@@ -3389,6 +3388,7 @@ interface AuthUserRow {
   google_subject: string | null;
   password_hash: string;
   password_salt: string;
+  password_iterations: number | null;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;

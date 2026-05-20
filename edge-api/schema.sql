@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   google_subject TEXT,
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
+  password_iterations INTEGER NOT NULL DEFAULT 100000,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_login_at TEXT
