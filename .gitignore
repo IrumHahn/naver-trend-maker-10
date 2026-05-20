@@ -6,6 +6,8 @@ node_modules
 .next_corrupt_*
 .next_mixed_*
 .next_prevercel_backup_*
+web/out
+.cf-pages-deploy
 dist
 output
 .env
